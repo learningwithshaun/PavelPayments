@@ -3,8 +3,9 @@
  *
  * API endpoints for the streaming service:
  *  - POST /api/stream/start          — user presses Play
+ *  - POST /api/stream/payment        — Web Monetization micropayment tick
  *  - POST /api/stream/end            — user pauses or stops
- *  - GET  /api/stream/session/:uid   — current session + today's minutes + estimated charge
+ *  - GET  /api/stream/session/:uid   — current session + today's minutes + streamed total
  *  - POST /api/stream/subscribe      — initiate a streaming subscription (GNAP flow)
  *  - GET  /api/stream/subscriptions/:uid
  *  - GET  /api/stream/pricing        — rate constants for the frontend
@@ -21,10 +22,10 @@ const { User, Subscription } = require("../models");
 
 /**
  * POST /api/stream/start
- * Body: { uid, contentId, contentTitle?, contentType? }
+ * Body: { uid, contentId, contentTitle?, contentType?, durationSeconds? }
  */
 async function startStream(req, res) {
-  const { uid, contentId, contentTitle, contentType } = req.body;
+  const { uid, contentId, contentTitle, contentType, durationSeconds } = req.body;
   if (!uid || !contentId) {
     return res.status(400).json({ error: "uid and contentId are required" });
   }
@@ -35,8 +36,34 @@ async function startStream(req, res) {
       contentId,
       contentTitle,
       contentType,
+      durationSeconds,
     });
     res.status(201).json({ session });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}
+
+// ── Web Monetization payment tick ──────────────────────────────────────────────
+
+/**
+ * POST /api/stream/payment
+ * Body: { sessionId, amountCents, assetCode? }
+ * Records a streamed micropayment reported by the viewer's monetization agent.
+ */
+async function recordPayment(req, res) {
+  const { sessionId, amountCents, assetCode } = req.body;
+  if (!sessionId || amountCents == null) {
+    return res.status(400).json({ error: "sessionId and amountCents are required" });
+  }
+
+  try {
+    const session = await streamingSessionService.recordPayment({
+      sessionId,
+      amountCents,
+      assetCode,
+    });
+    res.json({ session });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -45,15 +72,41 @@ async function startStream(req, res) {
 // ── End stream ────────────────────────────────────────────────────────────────
 
 /**
- * POST /api/stream/end
- * Body: { sessionId }
+ * POST /api/stream/progress
+ * Body: { sessionId, secondsWatched?, durationSeconds? }
+ * Heartbeat from the player so today's watched minutes update while playing,
+ * without closing the session.
  */
-async function endStream(req, res) {
-  const { sessionId } = req.body;
+async function recordProgress(req, res) {
+  const { sessionId, secondsWatched, durationSeconds } = req.body;
   if (!sessionId) return res.status(400).json({ error: "sessionId is required" });
 
   try {
-    const session = await streamingSessionService.endStream({ sessionId });
+    const session = await streamingSessionService.recordProgress({
+      sessionId,
+      secondsWatched,
+      durationSeconds,
+    });
+    res.json({ session });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}
+
+/**
+ * POST /api/stream/end
+ * Body: { sessionId, secondsWatched?, durationSeconds? }
+ */
+async function endStream(req, res) {
+  const { sessionId, secondsWatched, durationSeconds } = req.body;
+  if (!sessionId) return res.status(400).json({ error: "sessionId is required" });
+
+  try {
+    const session = await streamingSessionService.endStream({
+      sessionId,
+      secondsWatched,
+      durationSeconds,
+    });
     res.json({ session });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -70,7 +123,7 @@ async function getSession(req, res) {
   if (!uid) return res.status(400).json({ error: "uid is required" });
 
   try {
-    const { currentSession, todayMinutes, user } =
+    const { currentSession, todayMinutes, todayStreamedCents, user } =
       await streamingSessionService.getStreamStatus({ nfcUid: uid });
 
     const subscription = await Subscription.findOne({
@@ -78,16 +131,15 @@ async function getSession(req, res) {
       order: [["createdAt", "DESC"]],
     });
 
-    let estimatedCharge = null;
-    if (subscription && todayMinutes > 0) {
-      estimatedCharge = billingService.calculateStreamingCharge({
-        tier: subscription.tier,
-        totalMinutes: todayMinutes,
-        currency: user.preferredCurrency ?? "USD",
-      });
-    }
+    const currency = user.preferredCurrency ?? "USD";
 
-    res.json({ currentSession, todayMinutes, estimatedCharge, subscription });
+    res.json({
+      currentSession,
+      todayMinutes,
+      todayStreamedCents,
+      streamedToday: todayStreamedCents > 0 ? { amount: todayStreamedCents, currency } : null,
+      subscription,
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -196,4 +248,4 @@ function getPricing(_req, res) {
   });
 }
 
-module.exports = { startStream, endStream, getSession, subscribe, listSubscriptions, getPricing };
+module.exports = { startStream, recordPayment, recordProgress, endStream, getSession, subscribe, listSubscriptions, getPricing };

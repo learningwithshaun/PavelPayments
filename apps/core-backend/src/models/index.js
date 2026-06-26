@@ -123,6 +123,26 @@ const StreamSession = sequelize.define("StreamSession", {
   endedAt: { type: DataTypes.DATE }, // null = currently watching
   minutesWatched: { type: DataTypes.INTEGER, defaultValue: 0 },
   date: { type: DataTypes.DATEONLY, allowNull: false },
+
+  // ── Web Monetization streaming ────────────────────────────────────────────
+  // Payment is streamed in real time by the viewer's Web Monetization agent
+  // directly to the service wallet. `streamedCents` accumulates the amount the
+  // browser reported via `monetization` events over the life of the session.
+  durationSeconds: { type: DataTypes.INTEGER, defaultValue: 0 },
+  secondsWatched: { type: DataTypes.INTEGER, defaultValue: 0 },
+  streamedCents: { type: DataTypes.INTEGER, defaultValue: 0 },
+  assetCode: { type: DataTypes.STRING, defaultValue: "USD" },
+
+  // ── Legacy upfront / refund fields (retained for historical rows) ──────────
+  priceCents: { type: DataTypes.INTEGER, defaultValue: 0 },
+  upfrontCents: { type: DataTypes.INTEGER, defaultValue: 0 },
+  watchedFraction: { type: DataTypes.FLOAT, defaultValue: 0 },
+  actualChargeCents: { type: DataTypes.INTEGER, defaultValue: 0 },
+  refundCents: { type: DataTypes.INTEGER, defaultValue: 0 },
+  refundStatus: {
+    type: DataTypes.ENUM("none", "pending", "refunded", "failed"),
+    defaultValue: "none",
+  },
 });
 
 // ── Associations ──────────────────────────────────────────────────────────────

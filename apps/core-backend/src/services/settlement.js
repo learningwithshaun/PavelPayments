@@ -134,7 +134,10 @@ async function settleOne(subscription, settleDate) {
     breakdown = chargeResult.breakdown;
 
   } else if (subscription.serviceType === "streaming") {
-    // Sum all closed stream sessions for the day
+    // Web Monetization model: payment was streamed in real time straight to the
+    // service wallet while the user watched, so settlement does NOT charge again.
+    // We only record the day's streamed total for history/reporting and return
+    // before any outgoing payment is fired.
     const streamSessions = await StreamSession.findAll({
       where: {
         userId: user.id,
@@ -143,29 +146,30 @@ async function settleOne(subscription, settleDate) {
       },
     });
 
-    totalMinutes = streamSessions.reduce((sum, s) => sum + (s.minutesWatched ?? 0), 0);
+    const totalStreamed = streamSessions.reduce((sum, s) => sum + (s.streamedCents ?? 0), 0);
+    const streamedMinutes = streamSessions.reduce((sum, s) => sum + (s.minutesWatched ?? 0), 0);
 
-    if (subscription.subscriptionType === "dynamic" && totalMinutes === 0) {
-      await DailySettlement.create({
-        userId: user.id,
-        serviceType: "streaming",
-        settlementDate: settleDate,
-        totalMinutes: 0,
-        chargeAmountCents: 0,
-        currency: user.preferredCurrency ?? "USD",
-        status: "skipped",
-        breakdown: {},
-      });
-      return;
-    }
-
-    chargeResult = billingService.calculateStreamingCharge({
-      tier: subscription.tier,
-      totalMinutes,
+    await DailySettlement.create({
+      userId: user.id,
+      serviceType: "streaming",
+      settlementDate: settleDate,
+      totalMinutes: streamedMinutes,
+      chargeAmountCents: 0, // nothing is charged at settlement — WM paid in real time
       currency: user.preferredCurrency ?? "USD",
+      status: "skipped",
+      breakdown: {
+        method: "web-monetization",
+        totalStreamedCents: totalStreamed,
+        sessions: streamSessions.map((s) => ({
+          contentId: s.contentId,
+          contentTitle: s.contentTitle,
+          minutesWatched: s.minutesWatched ?? 0,
+          streamedCents: s.streamedCents ?? 0,
+          assetCode: s.assetCode ?? "USD",
+        })),
+      },
     });
-
-    breakdown = chargeResult.breakdown;
+    return;
   }
 
   // Fire Open Payments outgoing payment

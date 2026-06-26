@@ -50,6 +50,8 @@ app.get("/api/gym/pos/pay/callback", gymController.posPaymentCallback);
 
 // ── Streaming routes ──────────────────────────────────────────────────────────
 app.post("/api/stream/start", streamingController.startStream);
+app.post("/api/stream/payment", streamingController.recordPayment);
+app.post("/api/stream/progress", streamingController.recordProgress);
 app.post("/api/stream/end", streamingController.endStream);
 app.get("/api/stream/session/:uid", streamingController.getSession);
 app.post("/api/stream/subscribe", streamingController.subscribe);

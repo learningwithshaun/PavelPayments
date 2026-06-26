@@ -34,3 +34,7 @@ yarn-error.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Videos
+*.mkv
+*.mp4

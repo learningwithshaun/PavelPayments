@@ -144,6 +144,50 @@ function calculateStreamingCharge({ tier, totalMinutes, currency = DEFAULT_CURRE
   };
 }
 
+// ── Streaming (per-title upfront + refund) ────────────────────────────────────
+
+/**
+ * Calculate the charge for a single piece of content under the
+ * "pay upfront, refund the unwatched portion" model.
+ *
+ * The user is charged `priceCents` upfront when they press play. The amount
+ * they actually owe is `priceCents × watchedFraction`; the remainder is
+ * refunded back to their wallet at settlement.
+ *
+ * Live content has no finite duration, so it is charged flat (no refund).
+ *
+ * @param {{ priceCents: number, watchedFraction: number, contentType?: string }} opts
+ * @returns {{ priceCents: number, upfrontCents: number, actualChargeCents: number,
+ *             refundCents: number, watchedFraction: number, assetScale: number }}
+ */
+function calculateMovieCharge({ priceCents, watchedFraction, contentType = "movie" }) {
+  const price = Math.max(0, Math.round(priceCents ?? 0));
+
+  if (contentType === "live") {
+    return {
+      priceCents: price,
+      upfrontCents: price,
+      actualChargeCents: price,
+      refundCents: 0,
+      watchedFraction: 1,
+      assetScale: ASSET_SCALE,
+    };
+  }
+
+  const fraction = Math.min(Math.max(watchedFraction ?? 0, 0), 1);
+  const actualChargeCents = Math.round(price * fraction);
+  const refundCents = Math.max(0, price - actualChargeCents);
+
+  return {
+    priceCents: price,
+    upfrontCents: price,
+    actualChargeCents,
+    refundCents,
+    watchedFraction: fraction,
+    assetScale: ASSET_SCALE,
+  };
+}
+
 // ── Legacy compat ─────────────────────────────────────────────────────────────
 // Kept for the existing /api/trigger-payment NFC route.
 
@@ -164,6 +208,7 @@ module.exports = {
   calculateGymDynamicCharge,
   calculateGymStaticCharge,
   calculateStreamingCharge,
+  calculateMovieCharge,
   computePeakMinutes,
   GYM_DYNAMIC_BASE,
   GYM_STATIC_BASE,
