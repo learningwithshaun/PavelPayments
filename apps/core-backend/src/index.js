@@ -41,6 +41,13 @@ app.get("/api/gym/subscriptions/:uid", gymController.listSubscriptions);
 app.get("/api/gym/pricing", gymController.getPricing);
 app.get("/api/gym/history/:uid", gymController.getHistory);
 
+// ── Gym POS routes ────────────────────────────────────────────────────────────
+app.post("/api/gym/pos/incoming-payment", gymController.createPOSPayment);
+app.get("/api/gym/pos/payment-status/:incomingPaymentId", gymController.getPOSPaymentStatus);
+app.get("/api/gym/pos/pay-page", gymController.getPOSPayPage);
+app.post("/api/gym/pos/pay", gymController.startPOSPayment);
+app.get("/api/gym/pos/pay/callback", gymController.posPaymentCallback);
+
 // ── Streaming routes ──────────────────────────────────────────────────────────
 app.post("/api/stream/start", streamingController.startStream);
 app.post("/api/stream/end", streamingController.endStream);
@@ -79,8 +86,9 @@ cron.schedule("0 0 * * *", () => {
 });
 
 // ── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`[core-backend] Listening on http://localhost:${PORT}`);
+// Bind to 0.0.0.0 so phones on the same LAN can reach the POS pay page + callback.
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[core-backend] Listening on http://0.0.0.0:${PORT} (LAN-accessible)`);
   console.log(`[cron] Daily settlement scheduled for 00:00`);
 });
 

@@ -66,6 +66,22 @@ async function settleOne(subscription, settleDate) {
   const user = await User.findByPk(subscription.userId);
   if (!user) return;
 
+  // Prevent duplicate settlement processing for the same user/service/date.
+  const existingSettlement = await DailySettlement.findOne({
+    where: {
+      userId: user.id,
+      serviceType: subscription.serviceType,
+      settlementDate: settleDate,
+      status: { [Op.in]: ["charged", "skipped"] },
+    },
+  });
+  if (existingSettlement) {
+    console.log(
+      `[settlement] Already settled for user=${user.id} service=${subscription.serviceType} date=${settleDate}`
+    );
+    return;
+  }
+
   const mandate = await Mandate.findByPk(subscription.mandateId);
   if (!mandate || !mandate.isActive) {
     console.warn(`[settlement] No active mandate for subscription ${subscription.id}`);

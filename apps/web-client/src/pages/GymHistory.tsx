@@ -82,11 +82,11 @@ export default function GymHistory() {
           zIndex: 100,
         }}
       >
-        <Link href={nfcUid ? `/GymDashboard?uid=${encodeURIComponent(nfcUid)}` : "/GymDashboard"} style={{ color: "#94a3b8", textDecoration: "none", fontSize: 14 }}>
-          ← Gym Dashboard
+        <Link href="/POSDashboard" style={{ color: "#94a3b8", textDecoration: "none", fontSize: 14 }}>
+          ← Front Desk
         </Link>
         <span style={{ color: "#475569" }}>|</span>
-        <span style={{ fontWeight: 700, fontSize: 16 }}>🏋️ Settlement History</span>
+        <span style={{ fontWeight: 700, fontSize: 16 }}>🏋️ Payment History</span>
       </header>
       <main style={{ maxWidth: 900, margin: "2rem auto", padding: "0 1.5rem" }}>{children}</main>
     </>

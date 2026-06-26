@@ -10,7 +10,7 @@
 
 const openPaymentsService = require("../services/open-payments");
 const billingService = require("../services/billing");
-const { Transaction } = require("../models");
+const { Transaction, User } = require("../models");
 
 /**
  * @param {import("express").Request} req
@@ -36,8 +36,14 @@ async function triggerPayment(req, res) {
     });
 
     // 3. Persist the transaction record
+    const user = await User.findOne({ where: { nfcUid: uid } });
+    if (!user) {
+      throw new Error(`No user found for NFC UID: ${uid}`);
+    }
+
     const tx = await Transaction.create({
-      userId: uid,
+      userId: user.id,
+      walletAddress: user.walletAddress,
       paymentId: payment.id,
       amount: charge.amount,
       currency: charge.currency,

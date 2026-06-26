@@ -130,11 +130,6 @@ async function subscribe(req, res) {
       };
     }
 
-    const { interactRedirectUrl, continueToken } = await gnapAuthService.initiateGrant(
-      walletAddress,
-      grantOpts
-    );
-
     const today = new Date().toISOString().slice(0, 10);
     const sub = await Subscription.create({
       userId: user.id,
@@ -147,8 +142,21 @@ async function subscribe(req, res) {
       isActive: false,
     });
 
-    res.cookie("gnap_continue_token", continueToken, { httpOnly: true, sameSite: "lax" });
-    res.cookie("pending_subscription_id", sub.id, { httpOnly: true, sameSite: "lax" });
+    let interactRedirectUrl;
+    try {
+      const grant = await gnapAuthService.initiateGrant(walletAddress, {
+        ...grantOpts,
+        context: {
+          userId: user.id,
+          pendingSubscriptionId: sub.id,
+          serviceType: "streaming",
+        },
+      });
+      interactRedirectUrl = grant.interactRedirectUrl;
+    } catch (grantErr) {
+      await sub.destroy();
+      throw grantErr;
+    }
 
     res.json({ interactRedirectUrl, subscriptionId: sub.id });
   } catch (err) {

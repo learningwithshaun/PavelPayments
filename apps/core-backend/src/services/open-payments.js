@@ -30,6 +30,7 @@ async function getClient() {
     walletAddressUrl: process.env.WALLET_ADDRESS,
     privateKey: keyConfig.privateKeyPath,
     keyId: process.env.KEY_ID,
+    validateResponses: false,
   });
 
   return _client;
@@ -111,4 +112,4 @@ async function createOutgoingPaymentFromMandate({ mandate, walletAddress, amount
   return payment;
 }
 
-module.exports = { resolveWalletAddress, createOutgoingPayment, createOutgoingPaymentFromMandate };
+module.exports = { getClient, resolveWalletAddress, createOutgoingPayment, createOutgoingPaymentFromMandate };

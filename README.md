@@ -4,10 +4,11 @@ PavelPayments is a usage-based billing demo for hackathons, built on Interledger
 It shows how to connect wallet authorization (GNAP) with real usage events (gym taps or video watching)
 and settle charges automatically.
 
-The project supports two services:
+The project supports two services plus a live POS terminal:
 
 - Gym: billing by visit time with dynamic pricing, plus optional flat subscriptions.
 - Streaming: billing by watched minutes.
+- POS Terminal: instant one-shot access passes (30 min, 1 hr, 2 hr, day, weekly, monthly, yearly) paid via QR code. The merchant creates an Open Payments incoming payment; the customer scans the QR with their Interledger wallet and confirms; the dashboard detects settlement in real-time and unlocks the turnstile.
 
 At midnight, a settlement process calculates daily usage and creates outgoing Open Payments.
 
@@ -18,6 +19,11 @@ At midnight, a settlement process calculates daily usage and creates outgoing Op
 1. [What This Project Does](#what-this-project-does)
 2. [System Architecture](#system-architecture)
 3. [End-to-End Flows (Charts)](#end-to-end-flows-charts)
+   - Subscription and wallet authorization
+   - Gym usage (tap in / tap out)
+   - Streaming usage
+   - **POS instant payment (QR demo)**
+   - Midnight settlement
 4. [Business Logic](#business-logic)
 5. [Repository Layout](#repository-layout)
 6. [Local Setup (Detailed)](#local-setup-detailed)
@@ -38,12 +44,14 @@ This is a full-stack monorepo where:
 - A daily settlement job converts usage into charges.
 - Outgoing payments are sent through Open Payments.
 - Transactions and settlement history are stored for dashboards.
+- A POS terminal creates incoming payments on the merchant wallet and generates QR codes for instant customer settlement.
 
 Why this matters for the hackathon:
 
 - Demonstrates pay-as-you-use billing, not a fixed monthly bill.
 - Demonstrates machine-friendly payments over open standards.
 - Demonstrates one backend supporting multiple usage-based products.
+- Demonstrates merchant-side Open Payments (incoming payment creation + QR handoff) as a live, scannable demo.
 
 ---
 
@@ -55,6 +63,7 @@ Why this matters for the hackathon:
 flowchart LR
   U[User]
   W[Web Client<br/>Next.js + React]
+  POS[POS Terminal<br/>POSDashboard.tsx]
   E[Edge Terminal<br/>NFC Scanner]
   B[Core Backend<br/>Express + Sequelize]
   DB[(PostgreSQL)]
@@ -63,11 +72,14 @@ flowchart LR
 
   U --> W
   U --> E
+  U -->|Scan QR| POS
   E -->|Tap In / Tap Out| B
   W -->|REST API| B
+  POS -->|Create Incoming Payment| B
   B --> DB
   B --> R
   B -->|GNAP + Outgoing Payment| OP
+  B -->|Incoming Payment Grant| OP
 ```
 
 ### Runtime responsibilities
@@ -155,7 +167,30 @@ sequenceDiagram
   Backend-->>Frontend: Updated daily usage estimate
 ```
 
-### 4. Midnight settlement flow
+### 4. POS instant payment flow
+
+```mermaid
+sequenceDiagram
+  participant Staff as Gym Staff (POS Terminal)
+  participant Backend
+  participant OP as Open Payments Testnet
+  participant Customer as Customer Wallet
+
+  Staff->>Backend: POST /api/gym/pos/incoming-payment { durationKey }
+  Backend->>OP: grant.request(incoming-payment, non-interactive)
+  OP-->>Backend: access_token
+  Backend->>OP: incomingPayment.create(amount, merchantWallet)
+  OP-->>Backend: incomingPayment.id (URL)
+  Backend-->>Staff: { paymentUrl, amount, label }
+  Staff->>Staff: QR code rendered from paymentUrl
+  Customer->>Customer: Scan QR → wallet opens incoming payment URL
+  Customer->>OP: Authorize + send payment
+  OP-->>Backend: Payment settled (polled via GET payment-status)
+  Backend-->>Staff: status=completed
+  Staff->>Staff: Show ✅ Payment Complete + Turnstile Unlocked
+```
+
+### 5. Midnight settlement flow
 
 ```mermaid
 flowchart TD
@@ -214,6 +249,22 @@ Used for flat subscriptions regardless of duration.
 | Yearly | $800.00 |
 
 For weekly/monthly/yearly static plans, GNAP grant limits include an interval cap so wallet-side enforcement matches the subscription period.
+
+### POS access pass pricing
+
+One-shot passes sold from the POS Terminal (no subscription required). Amounts are in ZAR-cents; the QR encodes the raw incoming payment URL.
+
+| Duration Key | Label | Amount |
+|---|---|---|
+| 30min | 30 Min Pass | R15.00 |
+| 1hr | 1 Hour Pass | R30.00 |
+| 2hr | 2 Hour Pass | R50.00 |
+| day | Day Pass | R60.00 |
+| weekly | Weekly Pass | R140.00 |
+| monthly | Monthly Pass | R400.00 |
+| yearly | Yearly Pass | R800.00 |
+
+The QR code encodes the raw Open Payments incoming payment URL (e.g. `https://ilp.rafiki.money/incoming-payments/<uuid>`). Interledger wallets (Rafiki) recognize this URL directly when scanned.
 
 ### Streaming charge model
 
@@ -309,6 +360,13 @@ REDIS_URL=redis://localhost:6379
 WALLET_ADDRESS=https://ilp.interledger-test.dev/yourname
 KEY_ID=<uuid-from-testnet-wallet>
 
+# POS Terminal — the merchant wallet that receives incoming payments.
+# Falls back to WALLET_ADDRESS if not set.
+MERCHANT_WALLET_ADDRESS=https://ilp.interledger-test.dev/yourgymwallet
+
+# Currency used for POS incoming payments (default: USD).
+PAYMENT_CURRENCY=USD
+
 BACKEND_PUBLIC_URL=http://localhost:4001
 FRONTEND_URL=http://localhost:3000
 
@@ -319,6 +377,7 @@ Important:
 
 - BACKEND_PUBLIC_URL must match your backend callback origin.
 - KEY_ID must match the key uploaded to wallet testnet.
+- MERCHANT_WALLET_ADDRESS is the wallet that receives POS payments; it must be registered on the same testnet and use the same key pair.
 - Keep keys/private.key local only.
 
 ### 4. Start infrastructure (Postgres and Redis)
@@ -382,6 +441,18 @@ curl -X POST http://localhost:4001/api/dev/settle-now
    - GET /api/stream/session/:uid
 5. Trigger settlement and review resulting transaction records.
 
+### Demo scenario C: POS instant payment (live QR demo)
+
+1. Open frontend at http://localhost:3000/POSDashboard (or click ⚡ POS Terminal in the Gym header).
+2. Select a billing mode (Dynamic or Static) and a pass duration (e.g. 1 Hour Pass — R30.00).
+3. Click “Generate Open Payments Quote”.
+   - The terminal log shows the incoming payment grant request and creation.
+   - A QR code appears in the center panel.
+4. Scan the QR code with an Interledger-compatible wallet (e.g. Rafiki testnet wallet).
+5. The wallet displays the payment details — customer confirms.
+6. The dashboard polls the backend every 2.5 s; within seconds the status badge flips to “STATUS: COMPLETED” and the “🔓 Turnstile Unlocked” banner appears.
+7. If live networking is unavailable during the demo, click the small “mock ✓” button in the bottom-right corner of the controls panel to instantly trigger the success state.
+
 ### Daily developer routine
 
 1. Pull latest branch.
@@ -390,6 +461,156 @@ curl -X POST http://localhost:4001/api/dev/settle-now
 4. Start local app: npm run dev.
 5. Run quick API health checks.
 6. Validate one gym flow and one streaming flow before merging.
+
+### Branching workflow for contributors (feature branches)
+
+Use feature branches for every change, even small UI tweaks.
+
+#### 1. Start from an up-to-date main
+
+```bash
+git checkout main
+git pull origin main
+```
+
+#### 2. Create a feature branch
+
+Branch naming pattern:
+
+- feat/<short-feature-name>
+- fix/<short-bug-name>
+- chore/<short-task-name>
+
+Examples:
+
+- feat/gym-pricing-breakdown
+- fix/settlement-timezone-bug
+- chore/readme-onboarding
+
+Create and switch:
+
+```bash
+git checkout -b feat/gym-pricing-breakdown
+```
+
+#### 3. Work, test, and commit in small checkpoints
+
+```bash
+git status
+git add .
+git commit -m "feat(gym): show pricing breakdown on dashboard"
+```
+
+Recommended commit style:
+
+- feat(scope): new behavior
+- fix(scope): bug fix
+- docs(scope): documentation update
+- chore(scope): maintenance
+
+#### 4. Keep your feature branch updated with main
+
+Before opening a PR, sync your branch to reduce merge conflicts:
+
+```bash
+git fetch origin
+git merge origin/main
+```
+
+If your team prefers rebasing, use this instead:
+
+```bash
+git fetch origin
+git rebase origin/main
+```
+
+Use either merge or rebase based on team preference, but stay consistent within one branch.
+
+#### 5. Push branch to remote
+
+```bash
+git push -u origin feat/gym-pricing-breakdown
+```
+
+#### 6. Open a Pull Request
+
+PR checklist for this project:
+
+1. Describe what changed and why.
+2. List affected areas (backend, web client, edge terminal, settlement).
+3. Include test steps used locally.
+4. Include screenshots for UI changes.
+5. Confirm README or API docs were updated if behavior changed.
+
+#### 7. After PR is merged
+
+```bash
+git checkout main
+git pull origin main
+git branch -d feat/gym-pricing-breakdown
+git push origin --delete feat/gym-pricing-breakdown
+```
+
+### Suggested branch ownership for this repository
+
+- Backend features: work primarily under apps/core-backend.
+- Frontend features: work primarily under apps/web-client.
+- Edge/NFC features: work primarily under apps/edge-terminal.
+- Cross-cutting features: split into focused commits so reviewers can follow backend and frontend impacts separately.
+
+### Team roles and work allocation (7 members)
+
+This split keeps the most technical and highest-risk work with the project lead, and distributes remaining work by complexity.
+
+#### Member 1: Project lead (highest difficulty)
+
+- Own GNAP and Open Payments integration end-to-end.
+- Own settlement engine design, reliability, and failure handling.
+- Make architecture decisions and approve technical PRs.
+- Final owner for release stability before demo.
+
+#### Member 2: Backend core engineer (high)
+
+- Build and harden gym and streaming session APIs.
+- Add request validation and error handling consistency.
+- Support backend refactors required by payment or settlement updates.
+
+#### Member 3: Frontend lead (medium-high)
+
+- Own main dashboards and subscription UX flows.
+- Integrate frontend with backend endpoints.
+- Ensure loading/error states are demo-safe and understandable.
+
+#### Member 4: Frontend support engineer (medium)
+
+- Implement secondary pages and reusable UI components.
+- Improve responsiveness and visual consistency.
+- Support history, usage, and detail views.
+
+#### Member 5: Edge terminal and NFC engineer (medium-low)
+
+- Own edge terminal event flow and backend posting reliability.
+- Implement fallback simulation for demos without physical NFC.
+- Ensure tap-in/tap-out events are reproducible for testing.
+
+#### Member 6: QA and validation owner (low-medium)
+
+- Own end-to-end validation checklist for gym and streaming.
+- Run regression tests after merges to main.
+- File bugs with clear reproduction steps and expected/actual results.
+
+#### Member 7: Documentation and demo operations (low-medium)
+
+- Own README/runbook quality and onboarding clarity.
+- Maintain demo script, environment checklist, and troubleshooting updates.
+- Ensure each merged feature has matching documentation notes.
+
+### Delivery timeline (recommended)
+
+1. Day 1: lock backend API contracts and start frontend integration.
+2. Day 2: complete core features and start full regression testing.
+3. Day 3: stabilize settlement/payment flow, polish UI and docs.
+4. Demo day: freeze changes, run final checklist, execute scripted demo.
 
 ### How to reset local state for clean demos
 
@@ -417,6 +638,8 @@ Then re-run app and resubscribe test users.
 | GET | /api/gym/subscriptions/:uid | - | Active subscriptions |
 | GET | /api/gym/pricing | - | Gym pricing constants |
 | GET | /api/gym/history/:uid | - | Recent daily settlements |
+| POST | /api/gym/pos/incoming-payment | { durationKey } | Create incoming payment for POS pass; returns paymentUrl + logs |
+| GET | /api/gym/pos/payment-status/:incomingPaymentId | - | Poll incoming payment status (pending / completed) |
 
 ### Streaming APIs
 
@@ -491,6 +714,10 @@ docker-compose up -d
   - Streaming session open/close logic.
 - apps/core-backend/src/services/settlement.js
   - Daily settlement scheduler and payment orchestration.
+- apps/core-backend/src/services/pos-payment.js
+  - POS incoming payment creation and status polling. Adapted from OpenRemit quoteFlow.ts (steps 1–3 only). Uses an in-memory Map to store access tokens between creation and status polls.
+- apps/core-backend/src/services/pos-open-payments.js
+  - normaliseWalletAddress and isFinalizedGrant helpers. Adapted from OpenRemit openPayments.ts.
 - apps/core-backend/src/controllers/grantController.js
   - GNAP callback finalization.
 

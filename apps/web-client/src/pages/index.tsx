@@ -11,10 +11,10 @@ const SECTIONS = [
     border: "#bfdbfe",
   },
   {
-    href: "/GymDashboard",
+    href: "/POSDashboard",
     label: "Gym",
     icon: "🏋️",
-    description: "Tap in and out of the gym — pay only for the minutes you use.",
+    description: "Front desk checkout — sell a pass and let members pay by scanning a code.",
     accent: "#16a34a",
     bg: "#f0fdf4",
     border: "#bbf7d0",
