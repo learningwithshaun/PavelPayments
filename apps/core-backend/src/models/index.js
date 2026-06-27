@@ -16,6 +16,7 @@ const sequelize = new Sequelize({
 const User = sequelize.define("User", {
   id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
   nfcUid: { type: DataTypes.STRING, allowNull: false, unique: true },
+  name: { type: DataTypes.STRING }, // display name set by front desk
   walletAddress: { type: DataTypes.STRING },
   preferredCurrency: { type: DataTypes.STRING(3), defaultValue: "USD" },
   isPremium: { type: DataTypes.BOOLEAN, defaultValue: false },
@@ -145,6 +146,28 @@ const StreamSession = sequelize.define("StreamSession", {
   },
 });
 
+// ── FlowSession ───────────────────────────────────────────────────────────────
+// Tracks an active PavelFlow (web-monetization-style) gym entry.
+// Payment streams from the customer's wallet until they scan the exit QR.
+const FlowSession = sequelize.define("FlowSession", {
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  walletAddress: { type: DataTypes.STRING, allowNull: false },
+  // Single-use tokens embedded in QR codes
+  entryToken: { type: DataTypes.STRING(64), unique: true, allowNull: false },
+  exitToken:  { type: DataTypes.STRING(64), unique: true, allowNull: false },
+  status: {
+    type: DataTypes.ENUM("streaming", "completed", "cancelled"),
+    defaultValue: "streaming",
+  },
+  tapInAt:  { type: DataTypes.DATE, allowNull: false },
+  tapOutAt: { type: DataTypes.DATE },
+  totalCents: { type: DataTypes.INTEGER, defaultValue: 0 },
+  currency: { type: DataTypes.STRING(3), defaultValue: "USD" },
+  // Rate used to calculate the running total while streaming
+  ratePerMinuteCents: { type: DataTypes.INTEGER, defaultValue: 50 }, // $0.50/min
+  name: { type: DataTypes.STRING }, // customer display name (optional)
+});
+
 // ── Associations ──────────────────────────────────────────────────────────────
 User.hasMany(Mandate, { foreignKey: "userId" });
 Mandate.belongsTo(User, { foreignKey: "userId" });
@@ -177,4 +200,5 @@ module.exports = {
   GymSession,
   DailySettlement,
   StreamSession,
+  FlowSession,
 };

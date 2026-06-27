@@ -29,9 +29,16 @@ const C = {
   amber: "#fbbf24",
 };
 
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:4001";
+
 export default function POSDashboard() {
   const [mode, setMode] = useState<Mode>("payg");
-  const [selectedKey, setSelectedKey] = useState<Tier>("1hr");
+  const [selectedKey, setSelectedKey] = useState<Tier>("day");
+
+  // PavelFlow state
+  const [flowStarting, setFlowStarting] = useState(false);
+  const [flowEntryQr, setFlowEntryQr] = useState<string | null>(null);
+  const [flowError, setFlowError] = useState<string | null>(null);
   const [minutes, setMinutes] = useState(45);
   const [peak, setPeak] = useState(isPeakNow());
   const [clock, setClock] = useState("");
@@ -85,12 +92,32 @@ export default function POSDashboard() {
 
   const handleMode = (m: Mode) => {
     setMode(m);
-    setSelectedKey(m === "payg" ? "1hr" : "weekly");
+    setSelectedKey(m === "payg" ? "day" : "weekly");
   };
 
   const handleReset = () => {
     reset();
     setMinutes(45);
+  };
+
+  const handleFlowStart = async () => {
+    setFlowStarting(true);
+    setFlowError(null);
+    try {
+      const r = await fetch(`${BACKEND}/api/gym/flow/start`, { method: "POST" });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? "Failed to start session");
+      setFlowEntryQr(d.entryQrUrl);
+    } catch (err: unknown) {
+      setFlowError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setFlowStarting(false);
+    }
+  };
+
+  const handleFlowReset = () => {
+    setFlowEntryQr(null);
+    setFlowError(null);
   };
 
   const todayTotal = sales.reduce((s, x) => s + x.amount, 0);
@@ -164,7 +191,7 @@ export default function POSDashboard() {
                     <span style={{ fontSize: 12, color: C.dim }}>{p.note}</span>
                   </span>
                   <span style={{ fontWeight: 800, fontSize: 16, color: on ? C.green : C.text }}>
-                    {money(p.upfrontCents)}
+                    {p.streaming ? <span style={{ fontSize: 13, color: on ? C.green : C.dim }}>Live</span> : money(p.upfrontCents)}
                   </span>
                 </button>
               );
@@ -173,21 +200,48 @@ export default function POSDashboard() {
 
           {/* Upfront total + action */}
           <div style={S.totalRow}>
-            <span>
-              <span style={{ display: "block", color: C.dim, fontSize: 13 }}>Pay now (upfront)</span>
-              <span style={{ fontSize: 11, color: C.dim }}>
-                {mode === "payg" ? "No subscription — pay per visit" : "Starts your membership"}
-              </span>
-            </span>
-            <span style={{ fontSize: 26, fontWeight: 900, color: C.green }}>
-              {money(selectedPass.upfrontCents)}
-            </span>
+            {selectedPass.streaming ? (
+              <>
+                <span>
+                  <span style={{ display: "block", color: C.dim, fontSize: 13 }}>Web Monetization</span>
+                  <span style={{ fontSize: 11, color: C.dim }}>No fixed amount — streams until tap-out</span>
+                </span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: C.green }}>Live 〰️</span>
+              </>
+            ) : (
+              <>
+                <span>
+                  <span style={{ display: "block", color: C.dim, fontSize: 13 }}>Pay now (upfront)</span>
+                  <span style={{ fontSize: 11, color: C.dim }}>
+                    {mode === "payg" ? "No subscription — pay per visit" : "Starts your membership"}
+                  </span>
+                </span>
+                <span style={{ fontSize: 26, fontWeight: 900, color: C.green }}>
+                  {money(selectedPass.upfrontCents)}
+                </span>
+              </>
+            )}
           </div>
 
           {isIdle ? (
-            <button className="btn" onClick={() => generatePayment(selectedKey)} style={S.primary}>
-              Charge customer
-            </button>
+            selectedPass.streaming ? (
+              /* ── PavelFlow — generate QR immediately, wallet entered on phone ── */
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {flowError && <p style={{ color: "#fca5a5", margin: 0, fontSize: 12 }}>{flowError}</p>}
+                <button
+                  className="btn"
+                  onClick={handleFlowStart}
+                  disabled={flowStarting}
+                  style={S.primary}
+                >
+                  {flowStarting ? "Starting…" : "Start PavelFlow Session"}
+                </button>
+              </div>
+            ) : (
+              <button className="btn" onClick={() => generatePayment(selectedKey)} style={S.primary}>
+                Charge customer
+              </button>
+            )
           ) : (
             <button className="btn" onClick={handleReset} style={S.secondary}>
               ↺ New sale
@@ -226,7 +280,7 @@ export default function POSDashboard() {
           {status === "pending" && qrUrl && (
             <div className="center fadeUp">
               <p style={{ margin: "0 0 14px", color: C.dim, fontSize: 14 }}>
-                {label} · <strong style={{ color: C.text }}>{money(amount)}</strong> now
+                {label}{selectedPass.streaming ? " · " : " · "}<strong style={{ color: C.text }}>{selectedPass.streaming ? "Web Monetization — live stream" : `${money(amount)} now`}</strong>
               </p>
               <div className="qrGlow" style={S.qrWrap}>
                 <QRCodeSVG value={qrUrl} size={210} level="H" bgColor="#ffffff" fgColor="#0b1120" />
@@ -292,63 +346,86 @@ export default function POSDashboard() {
         <aside style={{ display: "flex", flexDirection: "column", gap: 18 }}>
           {/* Dynamic pricing estimator */}
           <section style={S.panel} className="fadeUp">
-            <h2 style={S.h2}>What they&apos;ll actually pay</h2>
-            <p style={{ margin: "-6px 0 14px", fontSize: 12.5, color: C.dim }}>
-              {mode === "payg"
-                ? "Paid upfront, then reduced by time spent."
-                : "A daily charge that shrinks the more it's used."}
-            </p>
-
-            <div style={S.estTop}>
-              <div>
-                <div style={{ fontSize: 12, color: C.dim }}>{settledLabel}</div>
-                <div className="num" style={{ fontSize: 30, fontWeight: 900, color: C.green }}>
-                  {money(est.finalCents)}
-                </div>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontSize: 12, color: C.dim }}>was</div>
-                <div style={{ fontSize: 16, fontWeight: 700, color: C.dim, textDecoration: "line-through" }}>
-                  {money(est.baseCents)}
-                </div>
-                {est.savedCents > 0 && (
-                  <div style={{ fontSize: 12, color: C.amber, fontWeight: 700 }}>
-                    −{money(est.savedCents)}
+            {selectedPass.streaming ? (
+              <>
+                <h2 style={S.h2}>PavelFlow — Web Monetization</h2>
+                <p style={{ margin: "-6px 0 14px", fontSize: 12.5, color: C.dim }}>
+                  Micropayments stream continuously from the customer&apos;s wallet while they train. No upfront charge — the session closes when they tap out.
+                </p>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0.75rem", background: C.greenSoft, borderRadius: 8, marginBottom: 12 }}>
+                  <span style={{ fontSize: 22 }}>〰️</span>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 14, color: C.green }}>Streaming now</div>
+                    <div style={{ fontSize: 12, color: C.dim }}>Payments accumulate until tap-out</div>
                   </div>
-                )}
-              </div>
-            </div>
+                </div>
+                <div style={{ fontSize: 12.5, color: C.dim, lineHeight: 1.6 }}>
+                  <div>● No set amount required at the till</div>
+                  <div>● Wallet streams micropayments in real time</div>
+                  <div>● Total settled automatically on tap-out</div>
+                </div>
+              </>
+            ) : (
+              <>
+                <h2 style={S.h2}>What they&apos;ll actually pay</h2>
+                <p style={{ margin: "-6px 0 14px", fontSize: 12.5, color: C.dim }}>
+                  {mode === "payg"
+                    ? "Paid upfront, then reduced by time spent."
+                    : "A daily charge that shrinks the more it's used."}
+                </p>
 
-            <DiscountBar fraction={est.discountFraction} max={est.maxFraction} />
+                <div style={S.estTop}>
+                  <div>
+                    <div style={{ fontSize: 12, color: C.dim }}>{settledLabel}</div>
+                    <div className="num" style={{ fontSize: 30, fontWeight: 900, color: C.green }}>
+                      {money(est.finalCents)}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontSize: 12, color: C.dim }}>was</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: C.dim, textDecoration: "line-through" }}>
+                      {money(est.baseCents)}
+                    </div>
+                    {est.savedCents > 0 && (
+                      <div style={{ fontSize: 12, color: C.amber, fontWeight: 700 }}>
+                        −{money(est.savedCents)}
+                      </div>
+                    )}
+                  </div>
+                </div>
 
-            {/* Minutes slider */}
-            <label style={S.sliderLabel}>
-              <span>Time in gym</span>
-              <span style={{ color: C.text, fontWeight: 700 }}>{minutes} min</span>
-            </label>
-            <input
-              type="range"
-              min={0}
-              max={120}
-              step={5}
-              value={minutes}
-              onChange={(e) => setMinutes(Number(e.target.value))}
-              className="range"
-            />
+                <DiscountBar fraction={est.discountFraction} max={est.maxFraction} />
 
-            {/* Peak toggle */}
-            <button
-              className="seg"
-              onClick={() => setPeak((p) => !p)}
-              style={{
-                ...S.peakToggle,
-                borderColor: peak ? C.amber : C.line,
-                color: peak ? C.amber : C.dim,
-                background: peak ? "rgba(251,191,36,0.08)" : "transparent",
-              }}
-            >
-              {peak ? "● Peak hours — smaller discount" : "○ Off-peak — full discount"}
-            </button>
+                {/* Minutes slider */}
+                <label style={S.sliderLabel}>
+                  <span>Time in gym</span>
+                  <span style={{ color: C.text, fontWeight: 700 }}>{minutes} min</span>
+                </label>
+                <input
+                  type="range"
+                  min={0}
+                  max={120}
+                  step={5}
+                  value={minutes}
+                  onChange={(e) => setMinutes(Number(e.target.value))}
+                  className="range"
+                />
+
+                {/* Peak toggle */}
+                <button
+                  className="seg"
+                  onClick={() => setPeak((p) => !p)}
+                  style={{
+                    ...S.peakToggle,
+                    borderColor: peak ? C.amber : C.line,
+                    color: peak ? C.amber : C.dim,
+                    background: peak ? "rgba(251,191,36,0.08)" : "transparent",
+                  }}
+                >
+                  {peak ? "● Peak hours — smaller discount" : "○ Off-peak — full discount"}
+                </button>
+              </>
+            )}
           </section>
 
           {/* Today */}
@@ -380,6 +457,35 @@ export default function POSDashboard() {
           </section>
         </aside>
       </div>
+
+      {/* ── PavelFlow Entry QR Modal ──────────────────────────────────────── */}
+      {flowEntryQr && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: "1rem" }}
+          onClick={handleFlowReset}>
+          <div style={{ background: "#111a2e", border: `1px solid ${C.line}`, borderRadius: 16, padding: "1.5rem", width: "100%", maxWidth: 400, boxShadow: "0 20px 60px rgba(0,0,0,0.6)" }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+              <div>
+                <div style={{ fontWeight: 800, fontSize: 16, color: C.text }}>Entry QR — PavelFlow</div>
+                <div style={{ fontSize: 12, color: C.dim, marginTop: 2 }}>Customer scans to confirm entry and start their stream</div>
+              </div>
+              <button onClick={handleFlowReset} style={{ background: "none", border: "none", color: C.dim, fontSize: 18, cursor: "pointer", lineHeight: 1, padding: 4 }}>✕</button>
+            </div>
+            <div style={{ background: C.greenSoft, border: `1px solid ${C.green}`, borderRadius: 8, padding: "0.65rem 1rem", marginBottom: 14, fontSize: 13, color: C.green }}>
+              〰️ PavelFlow — $0.50/min · max $60.00/day
+            </div>
+            <div style={{ display: "flex", justifyContent: "center", padding: "1.25rem", background: "#fff", borderRadius: 10 }}>
+              <QRCodeSVG value={flowEntryQr} size={210} level="H" bgColor="#ffffff" fgColor="#0b1120" />
+            </div>
+            <p style={{ fontSize: 12, color: C.dim, textAlign: "center", marginTop: 12 }}>
+              Customer scans → confirms entry → stream begins
+            </p>
+            <button onClick={handleFlowReset} style={{ width: "100%", marginTop: 12, padding: "0.6rem", background: C.panelSoft, border: `1px solid ${C.line}`, borderRadius: 8, color: C.dim, fontSize: 13, cursor: "pointer" }}>
+              ↺ New session
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

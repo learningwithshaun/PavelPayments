@@ -1,16 +1,15 @@
 # PavelPayments
 
-PavelPayments is a usage-based billing demo for hackathons, built on Interledger Open Payments.
-It shows how to connect wallet authorization (GNAP) with real usage events (gym taps or video watching)
-and settle charges automatically.
+**PavelPayments** is a usage-based micropayment platform built on [Interledger Open Payments](https://openpayments.dev/), demonstrated as a gym + streaming service. It shows how to connect real usage events to real money movement — no fixed monthly bills, no pre-authorised lump sums. You pay exactly for what you use, settled the moment you walk out.
 
-The project supports two services plus a live POS terminal:
+Built for the hackathon in three interconnected layers:
+- **PavelGym** — tap-in/tap-out gym access with dynamic pricing and instant QR passes
+- **PavelFlow** — streaming micropayment sessions: the meter runs while you train, stops the moment you exit
+- **PavelFlix** — video streaming paid by the second using the **Web Monetization standard** — the browser streams micropayments directly to the merchant wallet while the video plays
 
-- Gym: billing by visit time with dynamic pricing, plus optional flat subscriptions.
-- Streaming: billing by watched minutes.
-- POS Terminal: instant one-shot access passes (30 min, 1 hr, 2 hr, day, weekly, monthly, yearly) paid via QR code. The merchant creates an Open Payments incoming payment; the customer scans the QR with their Interledger wallet and confirms; the dashboard detects settlement in real-time and unlocks the turnstile.
-
-At midnight, a settlement process calculates daily usage and creates outgoing Open Payments.
+> **Two different ways money moves in this project:**
+> - **PavelFlix** uses real [Web Monetization (WM v2)](https://webmonetization.org/specification/): a `<link rel="monetization">` tag in the page causes a WM-enabled browser to stream ILP micropayments directly from the viewer's wallet to the merchant — no backend payment code involved.
+> - **PavelFlow** uses the [Open Payments](https://openpayments.dev/) GNAP flow: the backend orchestrates a quote, interactive consent, and outgoing payment — one settlement transaction at the moment the customer walks out.
 
 ---
 
@@ -18,16 +17,16 @@ At midnight, a settlement process calculates daily usage and creates outgoing Op
 
 1. [What This Project Does](#what-this-project-does)
 2. [System Architecture](#system-architecture)
-3. [End-to-End Flows (Charts)](#end-to-end-flows-charts)
+3. [End-to-End Flows](#end-to-end-flows)
+   - PavelFlow — streaming gym session
+   - POS instant payment (QR demo)
    - Subscription and wallet authorization
-   - Gym usage (tap in / tap out)
-   - Streaming usage
-   - **POS instant payment (QR demo)**
+   - Gym tap in / tap out
    - Midnight settlement
 4. [Business Logic](#business-logic)
 5. [Repository Layout](#repository-layout)
-6. [Local Setup (Detailed)](#local-setup-detailed)
-7. [Runbook for Teammates](#runbook-for-teammates)
+6. [Local Setup](#local-setup)
+7. [Running the Demo](#running-the-demo)
 8. [API Reference](#api-reference)
 9. [Troubleshooting](#troubleshooting)
 10. [Developer Notes](#developer-notes)
@@ -36,75 +35,159 @@ At midnight, a settlement process calculates daily usage and creates outgoing Op
 
 ## What This Project Does
 
-This is a full-stack monorepo where:
+### The core idea
 
-- Users connect a testnet wallet.
-- The backend obtains a payment grant using GNAP.
-- Usage events are recorded (gym sessions or stream sessions).
-- A daily settlement job converts usage into charges.
-- Outgoing payments are sent through Open Payments.
-- Transactions and settlement history are stored for dashboards.
-- A POS terminal creates incoming payments on the merchant wallet and generates QR codes for instant customer settlement.
+Traditional billing stores your card and charges you later. Interledger lets us charge you **now**, for **exactly** what you used, straight from your wallet to the merchant — no intermediary holding your card details.
 
-Why this matters for the hackathon:
+This project demonstrates three billing patterns on a single backend:
 
-- Demonstrates pay-as-you-use billing, not a fixed monthly bill.
-- Demonstrates machine-friendly payments over open standards.
-- Demonstrates one backend supporting multiple usage-based products.
-- Demonstrates merchant-side Open Payments (incoming payment creation + QR handoff) as a live, scannable demo.
+| Pattern | Where | How |
+|---------|-------|-----|
+| **Browser micropayment stream** | PavelFlix | `<link rel="monetization">` → WM-enabled browser streams ILP payments directly to merchant wallet while video plays. **No charge at midnight — money already moved.** |
+| **Micropayment on exit** | PavelFlow (gym) | Meter runs while inside; one Open Payments transaction on the way out |
+| **Instant fixed-amount QR** | POS Terminal (gym) | Merchant creates incoming payment; customer scans QR and confirms |
+| **Midnight batch settlement** | Gym subscriptions | Usage accumulated during the day; single outgoing payment at midnight |
+
+### What a judge sees in a live demo
+
+1. Front desk taps **"Start PavelFlow Session"** — a QR code appears.
+2. Customer scans the QR on their phone, types their Interledger wallet address, confirms entry.
+3. The History screen shows the session ticking up in real time: elapsed time and running total.
+4. When the customer leaves, front desk clicks the session row — an exit QR appears.
+5. Customer scans the exit QR, sees the exact amount owed, taps **"Pay & Exit"** in their wallet app.
+6. The session closes in the History screen immediately. Money has moved.
 
 ---
 
 ## System Architecture
 
-### High-level component map
-
 ```mermaid
 flowchart LR
-  U[User]
-  W[Web Client<br/>Next.js + React]
-  POS[POS Terminal<br/>POSDashboard.tsx]
-  E[Edge Terminal<br/>NFC Scanner]
-  B[Core Backend<br/>Express + Sequelize]
+  Staff[Front Desk\nPOSDashboard]
+  Customer[Customer Phone]
+  History[History Screen\nGymHistory]
+  NFC[Edge Terminal\nNFC Scanner]
+  Backend[Core Backend\nExpress + Sequelize]
   DB[(PostgreSQL)]
-  R[(Redis)]
-  OP[Open Payments Testnet<br/>wallet.interledger-test.dev]
+  OP[Open Payments Testnet\nwallet.interledger-test.dev]
 
-  U --> W
-  U --> E
-  U -->|Scan QR| POS
-  E -->|Tap In / Tap Out| B
-  W -->|REST API| B
-  POS -->|Create Incoming Payment| B
-  B --> DB
-  B --> R
-  B -->|GNAP + Outgoing Payment| OP
-  B -->|Incoming Payment Grant| OP
+  Staff -->|Start PavelFlow / POS pass| Backend
+  NFC -->|Tap In / Tap Out| Backend
+  Customer -->|Scan entry QR → confirm wallet| Backend
+  Customer -->|Scan exit QR → approve payment| OP
+  OP -->|Payment settled| Backend
+  Backend --> DB
+  History -->|Polls every 5 s| Backend
+  Backend -->|Incoming / Outgoing Payments| OP
 ```
 
-### Runtime responsibilities
+### Component responsibilities
 
-- Web Client:
-  - Dashboard pages for gym and streaming.
-  - Wallet connect and subscription initiation.
-  - Manual testing flows (simulate taps and playback).
-- Edge Terminal:
-  - NFC entry/exit events pushed to backend.
-  - Useful for physical demo setup.
-- Core Backend:
-  - API endpoints, session tracking, billing calculations, settlement.
-  - GNAP grant initialization and callback finalization.
-  - Open Payments payment creation.
-- PostgreSQL:
-  - Persists users, mandates, subscriptions, sessions, settlements, transactions.
-- Redis:
-  - Supports fast state and cache style needs.
+| Component | Role |
+|-----------|------|
+| **POSDashboard** | Front desk terminal — start PavelFlow sessions, sell instant QR passes |
+| **GymHistory** | Live view of active streams, all-time visit history, exit QR modal, customer name management |
+| **PavelFlix** | Video streaming via Web Monetization — `<link rel="monetization">` streams ILP micropayments directly while the video plays |
+| **Core Backend** | All API endpoints, session tracking, payment orchestration, midnight settlement |
+| **Edge Terminal** | Physical NFC tap events pushed to backend |
+| **PostgreSQL** | Users, sessions (GymSession, FlowSession, StreamSession), settlements, transactions |
 
 ---
 
-## End-to-End Flows (Charts)
+## End-to-End Flows
 
-### 1. Subscription and wallet authorization flow
+### 1. PavelFlow — streaming gym session (the headline feature)
+
+```mermaid
+sequenceDiagram
+  participant Staff as Front Desk (POSDashboard)
+  participant Backend
+  participant OP as Open Payments
+  participant Phone as Customer Phone
+
+  Staff->>Backend: POST /api/gym/flow/start
+  Backend-->>Staff: { entryQrUrl, sessionId }
+  Staff->>Staff: Display entry QR code
+
+  Phone->>Backend: Scan entry QR → GET /api/gym/flow/entry-page
+  Backend-->>Phone: HTML page with wallet input
+  Phone->>Backend: POST /api/gym/flow/confirm-entry { walletAddress }
+  Backend-->>Phone: Entry confirmed — stream started
+
+  Note over Backend: Session status = "streaming"
+  Note over Staff: GymHistory polls every 5s — session appears live
+
+  Staff->>Staff: Click session row in GymHistory → exit QR modal appears
+
+  Phone->>Backend: Scan exit QR → GET /api/gym/flow/exit-page
+  Backend-->>Phone: HTML page showing elapsed time + amount owed
+  Phone->>Backend: POST /api/gym/flow/init-exit-payment
+  Backend->>OP: Create incoming payment (merchant wallet)
+  Backend->>OP: Create quote + interactive consent (customer wallet)
+  Backend-->>Phone: { interactUrl }
+  Phone->>OP: Customer approves payment in wallet app
+  OP->>Backend: GET /api/gym/flow/exit-callback
+  Backend->>OP: Finalize outgoing payment (money moves)
+  Backend-->>Backend: FlowSession → status=completed, totalCents set
+  Phone-->>Phone: "Stream settled!" success page
+```
+
+**Daily cap logic:** before charging, the backend sums all completed FlowSessions for that wallet address today. The customer can never be charged more than the Day Pass maximum ($60) across all their sessions in a calendar day.
+
+---
+
+### 2. POS instant payment (QR demo)
+
+```mermaid
+sequenceDiagram
+  participant Staff as Gym Staff (POSDashboard)
+  participant Backend
+  participant OP as Open Payments Testnet
+  participant Customer as Customer Wallet
+
+  Staff->>Backend: POST /api/gym/pos/incoming-payment { durationKey }
+  Backend->>OP: Non-interactive incoming-payment grant
+  Backend->>OP: incomingPayment.create(amount, merchantWallet)
+  Backend-->>Staff: { payPageUrl, amount, label }
+  Staff->>Staff: QR code rendered
+
+  Customer->>Backend: Scan QR → GET /api/gym/pos/pay-page
+  Customer->>Backend: POST /api/gym/pos/pay { walletAddress }
+  Backend->>OP: Quote on customer wallet
+  Backend->>OP: Interactive outgoing-payment grant
+  Backend-->>Customer: interactUrl (wallet consent)
+  Customer->>OP: Approve payment
+  OP->>Backend: GET /api/gym/pos/pay/callback
+  Backend-->>Staff: status = completed ✅
+```
+
+---
+
+### 3. PavelFlix — Web Monetization streaming
+
+```mermaid
+sequenceDiagram
+  participant Viewer as Viewer Browser
+  participant WM as WM Extension (ILP)
+  participant Merchant as Merchant Wallet
+  participant Backend
+
+  Viewer->>Backend: Press Play → POST /api/stream/start
+  Backend-->>Viewer: { sessionId }
+  Viewer->>Viewer: Mount <link rel="monetization" href="{merchantWallet}">
+  WM->>Merchant: Stream sub-cent ILP micropayments continuously
+  WM->>Viewer: fire `monetization` event (amountSent per packet)
+  Viewer->>Backend: POST /api/stream/update { streamedCents } (per cent)
+  Note over WM,Merchant: Money already moved — backend only records the amount
+  Viewer->>Backend: Press Stop → POST /api/stream/end
+  Viewer->>Viewer: Remove <link> — payments stop immediately
+  Note over Backend: midnight cron writes DailySettlement (chargeAmountCents=0, status=skipped)
+  Note over Backend: No outgoing payment is fired — WM already paid the merchant in real time
+```
+
+---
+
+### 4. Subscription and wallet authorization
 
 ```mermaid
 sequenceDiagram
@@ -112,22 +195,22 @@ sequenceDiagram
   participant Frontend
   participant Backend
   participant Wallet as Open Payments Wallet
-  participant DB as PostgreSQL
 
   User->>Frontend: Choose service + tier + subscription type
-  Frontend->>Backend: POST /api/gym/subscribe or /api/stream/subscribe
-  Backend->>Wallet: grant.request(interactive)
-  Wallet-->>Backend: interact.redirect URL + continue token
-  Backend-->>Frontend: Return interactRedirectUrl
+  Frontend->>Backend: POST /api/gym/subscribe
+  Backend->>Wallet: grant.request (interactive)
+  Wallet-->>Backend: interact.redirect + continue token
+  Backend-->>Frontend: interactRedirectUrl
   Frontend->>Wallet: Redirect user for approval
   Wallet->>Backend: GET /api/grants/callback?interact_ref=...
   Backend->>Wallet: grant.continue()
   Wallet-->>Backend: access_token
-  Backend->>DB: Upsert Mandate + activate Subscription
   Backend-->>Frontend: Subscription active
 ```
 
-### 2. Gym usage flow (tap in and tap out)
+---
+
+### 4. Gym NFC tap in / tap out
 
 ```mermaid
 sequenceDiagram
@@ -136,180 +219,149 @@ sequenceDiagram
   participant Backend
   participant DB as PostgreSQL
 
-  User->>Device: Tap in at gym entrance
-  Device->>Backend: POST /api/gym/tap-in
-  Backend->>DB: Create GymSession with tapInAt
+  User->>Device: Tap NFC card at entrance
+  Device->>Backend: POST /api/gym/tap-in { uid, terminalId }
+  Backend->>DB: Create GymSession (tapInAt)
   Backend-->>Device: Session opened
 
-  User->>Device: Tap out when leaving
-  Device->>Backend: POST /api/gym/tap-out
-  Backend->>DB: Close GymSession with tapOutAt + minutesAccumulated
+  User->>Device: Tap NFC card at exit
+  Device->>Backend: POST /api/gym/tap-out { uid }
+  Backend->>DB: Close GymSession (tapOutAt + minutesAccumulated)
   Backend-->>Device: Session closed
 ```
 
-### 3. Streaming usage flow (play and stop)
+---
 
-```mermaid
-sequenceDiagram
-  participant User
-  participant Frontend
-  participant Backend
-  participant DB as PostgreSQL
-
-  User->>Frontend: Press Play
-  Frontend->>Backend: POST /api/stream/start
-  Backend->>DB: Create StreamSession(startedAt)
-  Backend-->>Frontend: sessionId
-
-  User->>Frontend: Pause/Stop
-  Frontend->>Backend: POST /api/stream/end { sessionId }
-  Backend->>DB: Close StreamSession(endedAt, minutesWatched)
-  Backend-->>Frontend: Updated daily usage estimate
-```
-
-### 4. POS instant payment flow
-
-```mermaid
-sequenceDiagram
-  participant Staff as Gym Staff (POS Terminal)
-  participant Backend
-  participant OP as Open Payments Testnet
-  participant Customer as Customer Wallet
-
-  Staff->>Backend: POST /api/gym/pos/incoming-payment { durationKey }
-  Backend->>OP: grant.request(incoming-payment, non-interactive)
-  OP-->>Backend: access_token
-  Backend->>OP: incomingPayment.create(amount, merchantWallet)
-  OP-->>Backend: incomingPayment.id (URL)
-  Backend-->>Staff: { paymentUrl, amount, label }
-  Staff->>Staff: QR code rendered from paymentUrl
-  Customer->>Customer: Scan QR → wallet opens incoming payment URL
-  Customer->>OP: Authorize + send payment
-  OP-->>Backend: Payment settled (polled via GET payment-status)
-  Backend-->>Staff: status=completed
-  Staff->>Staff: Show ✅ Payment Complete + Turnstile Unlocked
-```
-
-### 5. Midnight settlement flow
+### 5. Midnight settlement
 
 ```mermaid
 flowchart TD
-  A[node-cron at 00:00] --> B[Load active subscriptions due today]
-  B --> C{Service Type}
-  C -->|Gym| D[Auto-close open gym sessions]
+  A[node-cron fires at 00:00] --> B[Load subscriptions due today]
+  B --> C{Service type?}
+  C -->|Gym| D[Auto-close open GymSessions]
   C -->|Streaming| E[Sum watched minutes]
   D --> F[Compute charge via billing.js]
   E --> F
   F --> G{Charge required?}
-  G -->|No usage on dynamic plan| H[Write DailySettlement status=skipped]
-  G -->|Yes| I[Create outgoing payment from mandate]
-  I --> J[Write Transaction + DailySettlement status=charged/failed]
+  G -->|Zero usage on dynamic plan| H[DailySettlement = skipped]
+  G -->|Usage exists| I[Create outgoing payment from mandate]
+  I --> J[Write Transaction + DailySettlement = charged / failed]
 ```
+
+> **Note:** PavelFlow sessions are settled at exit time (not at midnight) — the customer pays the moment they leave, not the next morning.
 
 ---
 
 ## Business Logic
 
-### Gym dynamic charge model
+### PavelFlow (streaming gym sessions)
 
-Used for pay-as-you-go subscriptions.
+| Parameter | Value |
+|-----------|-------|
+| Rate | $0.50 / minute |
+| Daily cap | $60.00 (same as Day Pass) |
+| Cap scope | Per wallet address, per calendar day (all sessions summed) |
+| Payment timing | At exit — one Open Payments transaction for the exact amount |
 
-Formula:
+The daily cap means: if a customer already paid $40 in a morning session and returns in the evening, they can be charged at most $20 more that day. If the cap is already exhausted, the session closes at $0 with no payment request.
 
-```text
-charge = base_rate - duration_discount + peak_adjustment
+### POS access passes (instant QR)
+
+| Pass | Amount |
+|------|--------|
+| 30 Min Pass | R15.00 |
+| 1 Hour Pass | R30.00 |
+| 2 Hour Pass | R50.00 |
+| Day Pass | R60.00 |
+| Weekly Pass | R140.00 |
+| Monthly Pass | R400.00 |
+| Yearly Pass | R800.00 |
+
+### Gym subscription (dynamic pricing)
+
+```
+charge = base_rate − duration_discount + peak_adjustment
 ```
 
-Parameters:
+- **base_rate**: daily=$6, weekly=$5, monthly=$4, yearly=$3
+- **duration_discount**: 0–50% as usage grows from 0 to 120 min
+- **peak_adjustment**: +$0.50 if majority of usage in peak hours (06–09, 17–20), −$0.30 otherwise
+- Zero usage on a dynamic plan → settlement skipped, no charge
 
-- base_rate by tier:
-  - daily = $6.00
-  - weekly = $5.00
-  - monthly = $4.00
-  - yearly = $3.00
-- duration_discount:
-  - linear from 0% to 50% as total minutes go from 0 to 120
-- peak_adjustment:
-  - +$0.50 if more than half of usage is in peak hours
-  - -$0.30 otherwise
-- peak windows:
-  - 06:00-09:00 and 17:00-20:00 local time
+### Gym subscription (static flat pricing)
 
-If no gym usage is found on a dynamic plan for the day, settlement is marked as skipped and no payment is sent.
-
-### Gym static charge model
-
-Used for flat subscriptions regardless of duration.
-
-| Tier | Flat Charge |
-|------|-------------|
+| Tier | Charge |
+|------|--------|
 | Daily | $6.00 |
 | Weekly | $28.00 |
 | Monthly | $80.00 |
 | Yearly | $800.00 |
 
-For weekly/monthly/yearly static plans, GNAP grant limits include an interval cap so wallet-side enforcement matches the subscription period.
+### PavelFlix (Web Monetization streaming)
 
-### POS access pass pricing
+PavelFlix uses the [Web Monetization specification](https://webmonetization.org/specification/) — a browser standard where a `<link rel="monetization" href="{walletAddress}">` tag signals the browser to stream micropayments over Interledger while the page is active.
 
-One-shot passes sold from the POS Terminal (no subscription required). Amounts are in ZAR-cents; the QR encodes the raw incoming payment URL.
+**How it works in the code:**
 
-| Duration Key | Label | Amount |
-|---|---|---|
-| 30min | 30 Min Pass | R15.00 |
-| 1hr | 1 Hour Pass | R30.00 |
-| 2hr | 2 Hour Pass | R50.00 |
-| day | Day Pass | R60.00 |
-| weekly | Weekly Pass | R140.00 |
-| monthly | Monthly Pass | R400.00 |
-| yearly | Yearly Pass | R800.00 |
+1. `useWebMonetization` hook mounts `<link rel="monetization" href={NEXT_PUBLIC_WALLET_ADDRESS}>` in `<head>` when play is pressed
+2. A WM-enabled browser (e.g. with the Interledger extension) reads the tag and begins streaming sub-cent ILP payments directly from the viewer's wallet to the merchant — the backend is **not** in the payment path
+3. The browser fires a `monetization` event on the link element for each payment sent, carrying `amountSent.value` and `amountSent.currency`
+4. The hook accumulates sub-cent amounts precisely and calls `onPayment(cents)` every time a whole new cent is crossed
+5. The player reports each increment to the backend → `StreamSession.streamedCents` grows in real time
+6. At midnight, the settlement cron charges the total as a single outgoing Open Payments transaction
 
-The QR code encodes the raw Open Payments incoming payment URL (e.g. `https://ilp.rafiki.money/incoming-payments/<uuid>`). Interledger wallets (Rafiki) recognize this URL directly when scanned.
+**Demo fallback:** if no WM-enabled browser is present (`link.relList.supports("monetization")` returns false), a configurable ticker (`NEXT_PUBLIC_STREAM_RATE_CENTS_PER_MIN`, default 12¢/min) simulates the stream so the live UI still works during demos. Real payments take over automatically and disable the fallback.
 
-### Streaming charge model
-
-Formula:
-
-```text
-charge = totalMinutes * ratePerMinute
-```
-
-Rates:
-
-- daily = $0.05/min
-- weekly = $0.04/min
-- monthly = $0.03/min
-- yearly = $0.02/min
+| Parameter | Value |
+|-----------|-------|
+| Fallback demo rate | 12¢ / min (configurable) |
+| Settlement timing | **None** — WM already paid the merchant in real time |
+| Midnight cron | Writes a `DailySettlement` record for history only (`chargeAmountCents=0`, `status=skipped`) |
+| Subscription rates | daily=5¢/min · weekly=4¢ · monthly=3¢ · yearly=2¢ |
 
 ---
 
 ## Repository Layout
 
-```text
+```
 apps/
-  core-backend/     Express API + billing + settlement + GNAP/OpenPayments integration
-  edge-terminal/    Terminal-side NFC event sender
-  web-client/       Next.js dashboards and testing UI
+  core-backend/         Express API, billing engine, settlement cron, Open Payments integration
+    src/
+      controllers/
+        gymController.js    All gym + PavelFlow endpoints + payment orchestration
+      models/
+        index.js            Sequelize models: User, GymSession, FlowSession, DailySettlement, ...
+      services/
+        billing.js          Pricing formulas
+        gym-session.js      Tap in/out logic
+        settlement.js       Midnight cron job
+        pos-payment.js      Incoming payment creation + interactive grant flow
+        open-payments.js    Open Payments SDK client
+  edge-terminal/        NFC event sender (physical demo hardware)
+  web-client/           Next.js app
+    src/
+      pages/
+        POSDashboard.tsx    Front desk terminal (POS + PavelFlow start)
+        GymHistory.tsx      Live sessions, all-time history, exit QR, name management
+        StreamingDashboard.tsx  PavelFlix dashboard
+        Dashboard.tsx       Gym subscription dashboard
 keys/
-  private.key       Local private key used for signatures (do not commit)
-  public.json       Public JWKS that you upload to wallet testnet
-docker-compose.yml  Local Postgres + Redis infrastructure
+  private.key           Local Ed25519 signing key (never commit)
+  public.json           JWKS uploaded to wallet testnet
+docker-compose.yml      PostgreSQL + Redis
 ```
 
 ---
 
-## Local Setup (Detailed)
+## Local Setup
 
-### 1. Prerequisites
+### Prerequisites
 
-- Docker Desktop running.
-- Node.js 20+.
-- npm installed.
-- Testnet wallet account at https://wallet.interledger-test.dev/.
+- Docker Desktop running
+- Node.js 20+
+- Testnet wallet at [wallet.interledger-test.dev](https://wallet.interledger-test.dev/)
 
-### 2. Generate Ed25519 keys
-
-Run from repository root:
+### 1. Generate keys
 
 ```bash
 node -e "
@@ -323,30 +375,9 @@ console.log('Keys written');
 "
 ```
 
-Upload keys/public.json to the testnet wallet:
+Upload `keys/public.json` to your testnet wallet under **Developer Keys**. Copy the generated key ID.
 
-1. Open wallet settings.
-2. Open Developer Keys.
-3. Add key and copy the generated key id.
-4. Use this value as KEY_ID in .env.
-
-### 3. Configure environment variables
-
-Create a local env file:
-
-On macOS/Linux:
-
-```bash
-cp .env.example .env
-```
-
-On PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Required values:
+### 2. Configure `.env`
 
 ```env
 POSTGRES_HOST=localhost
@@ -357,343 +388,177 @@ POSTGRES_PASSWORD=your_password
 
 REDIS_URL=redis://localhost:6379
 
+# Your signing wallet (used to authenticate SDK calls)
 WALLET_ADDRESS=https://ilp.interledger-test.dev/yourname
 KEY_ID=<uuid-from-testnet-wallet>
 
-# POS Terminal — the merchant wallet that receives incoming payments.
-# Falls back to WALLET_ADDRESS if not set.
+# Merchant wallet that receives POS and PavelFlow payments
+# Falls back to WALLET_ADDRESS if not set
 MERCHANT_WALLET_ADDRESS=https://ilp.interledger-test.dev/yourgymwallet
 
-# Currency used for POS incoming payments (default: USD).
+# Currency for incoming payments (default: USD)
 PAYMENT_CURRENCY=USD
 
-BACKEND_PUBLIC_URL=http://localhost:4001
+# Public backend URL — must be reachable by customer phones for QR flows
+# Use ngrok or similar for local demos: PUBLIC_BASE_URL=https://abc.ngrok.io
+BACKEND_PORT=4001
 FRONTEND_URL=http://localhost:3000
 
 NODE_ENV=development
 ```
 
-Important:
-
-- BACKEND_PUBLIC_URL must match your backend callback origin.
-- KEY_ID must match the key uploaded to wallet testnet.
-- MERCHANT_WALLET_ADDRESS is the wallet that receives POS payments; it must be registered on the same testnet and use the same key pair.
-- Keep keys/private.key local only.
-
-### 4. Start infrastructure (Postgres and Redis)
+### 3. Start infrastructure
 
 ```bash
 docker-compose up -d
-```
-
-Check containers:
-
-```bash
-docker-compose ps
-```
-
-### 5. Install dependencies and start app
-
-```bash
 npm install
 npm run dev
 ```
 
-Expected local ports:
+| Service | URL |
+|---------|-----|
+| Frontend | http://localhost:3000 |
+| Backend | http://localhost:4001 |
 
-- Frontend: http://localhost:3000
-- Backend: http://localhost:4001
-
-### 6. Verify everything is healthy
+### 4. Verify
 
 ```bash
-curl http://localhost:4001/health
 curl http://localhost:4001/api/gym/pricing
-curl http://localhost:4001/api/stream/pricing
 ```
 
 ---
 
-## Runbook for Teammates
+## Running the Demo
 
-### Demo scenario A: Gym dynamic billing
+### Demo A: PavelFlow (headline demo — ~3 minutes)
 
-1. Open frontend at http://localhost:3000.
-2. Connect wallet and subscribe to a gym dynamic plan.
-3. Simulate tap in and tap out from Gym dashboard or edge terminal.
-4. Verify session endpoint:
-   - GET /api/gym/session/:uid
-5. Trigger settlement manually:
+1. Open **http://localhost:3000/POSDashboard**
+2. Click **"Start PavelFlow Session"** — an entry QR appears
+3. On a phone, scan the QR → type a testnet wallet address → tap "Confirm Entry"
+4. Open **http://localhost:3000/GymHistory** — the session appears under "Live Streams" with a live timer and running total
+5. When ready to exit: click the session row → an exit QR modal appears with live stats
+6. On the phone, scan the exit QR → tap **"Pay & Exit — authorise in your wallet"** → approve in the wallet app
+7. The session disappears from "Live Streams" and appears in "Stream History" with the final charge
+
+> For local demos without a public URL, set `PUBLIC_BASE_URL` to your ngrok URL so the customer's phone can reach the backend.
+
+### Demo B: POS instant pass
+
+1. Select a pass (e.g. **Day Pass — R60.00**) on POSDashboard
+2. Click **"Generate Open Payments Quote"** — QR appears
+3. Scan QR with Interledger wallet → confirm payment
+4. Dashboard shows ✅ STATUS: COMPLETED
+
+### Demo C: Subscription + midnight settlement
+
+1. Open the Gym Dashboard → connect wallet → subscribe to a Dynamic Daily plan
+2. Use the NFC terminal or the tap simulator to record a session
+3. Trigger settlement manually:
 
 ```bash
 curl -X POST http://localhost:4001/api/dev/settle-now
 ```
 
-6. Check history endpoint:
-   - GET /api/gym/history/:uid
+4. Check **http://localhost:3000/GymHistory** → Settlement History section
 
-### Demo scenario B: Streaming billing
+### Customer history and names
 
-1. Subscribe in Streaming dashboard.
-2. Start stream (POST /api/stream/start is called).
-3. Stop stream (POST /api/stream/end).
-4. Check current session summary:
-   - GET /api/stream/session/:uid
-5. Trigger settlement and review resulting transaction records.
+The **GymHistory** page is a complete front desk view:
 
-### Demo scenario C: POS instant payment (live QR demo)
+- **Live Streams** — active PavelFlow sessions with real-time cost, click any row for the exit QR
+- **All Gym Visits** — every NFC tap-in ever recorded, all dates
+- **Stream History** — all completed PavelFlow sessions with duration and charge
+- **Settlement History** — midnight settlements for a given NFC UID
 
-1. Open frontend at http://localhost:3000/POSDashboard (or click ⚡ POS Terminal in the Gym header).
-2. Select a billing mode (Dynamic or Static) and a pass duration (e.g. 1 Hour Pass — R30.00).
-3. Click “Generate Open Payments Quote”.
-   - The terminal log shows the incoming payment grant request and creation.
-   - A QR code appears in the center panel.
-4. Scan the QR code with an Interledger-compatible wallet (e.g. Rafiki testnet wallet).
-5. The wallet displays the payment details — customer confirms.
-6. The dashboard polls the backend every 2.5 s; within seconds the status badge flips to “STATUS: COMPLETED” and the “🔓 Turnstile Unlocked” banner appears.
-7. If live networking is unavailable during the demo, click the small “mock ✓” button in the bottom-right corner of the controls panel to instantly trigger the success state.
-
-### Daily developer routine
-
-1. Pull latest branch.
-2. Ensure Docker is up: docker-compose up -d.
-3. Run npm install after dependency changes.
-4. Start local app: npm run dev.
-5. Run quick API health checks.
-6. Validate one gym flow and one streaming flow before merging.
-
-### Branching workflow for contributors (feature branches)
-
-Use feature branches for every change, even small UI tweaks.
-
-#### 1. Start from an up-to-date main
-
-```bash
-git checkout main
-git pull origin main
-```
-
-#### 2. Create a feature branch
-
-Branch naming pattern:
-
-- feat/<short-feature-name>
-- fix/<short-bug-name>
-- chore/<short-task-name>
-
-Examples:
-
-- feat/gym-pricing-breakdown
-- fix/settlement-timezone-bug
-- chore/readme-onboarding
-
-Create and switch:
-
-```bash
-git checkout -b feat/gym-pricing-breakdown
-```
-
-#### 3. Work, test, and commit in small checkpoints
-
-```bash
-git status
-git add .
-git commit -m "feat(gym): show pricing breakdown on dashboard"
-```
-
-Recommended commit style:
-
-- feat(scope): new behavior
-- fix(scope): bug fix
-- docs(scope): documentation update
-- chore(scope): maintenance
-
-#### 4. Keep your feature branch updated with main
-
-Before opening a PR, sync your branch to reduce merge conflicts:
-
-```bash
-git fetch origin
-git merge origin/main
-```
-
-If your team prefers rebasing, use this instead:
-
-```bash
-git fetch origin
-git rebase origin/main
-```
-
-Use either merge or rebase based on team preference, but stay consistent within one branch.
-
-#### 5. Push branch to remote
-
-```bash
-git push -u origin feat/gym-pricing-breakdown
-```
-
-#### 6. Open a Pull Request
-
-PR checklist for this project:
-
-1. Describe what changed and why.
-2. List affected areas (backend, web client, edge terminal, settlement).
-3. Include test steps used locally.
-4. Include screenshots for UI changes.
-5. Confirm README or API docs were updated if behavior changed.
-
-#### 7. After PR is merged
-
-```bash
-git checkout main
-git pull origin main
-git branch -d feat/gym-pricing-breakdown
-git push origin --delete feat/gym-pricing-breakdown
-```
-
-### Suggested branch ownership for this repository
-
-- Backend features: work primarily under apps/core-backend.
-- Frontend features: work primarily under apps/web-client.
-- Edge/NFC features: work primarily under apps/edge-terminal.
-- Cross-cutting features: split into focused commits so reviewers can follow backend and frontend impacts separately.
-
-### Team roles and work allocation (7 members)
-
-This split keeps the most technical and highest-risk work with the project lead, and distributes remaining work by complexity.
-
-#### Member 1: Project lead (highest difficulty)
-
-- Own GNAP and Open Payments integration end-to-end.
-- Own settlement engine design, reliability, and failure handling.
-- Make architecture decisions and approve technical PRs.
-- Final owner for release stability before demo.
-
-#### Member 2: Backend core engineer (high)
-
-- Build and harden gym and streaming session APIs.
-- Add request validation and error handling consistency.
-- Support backend refactors required by payment or settlement updates.
-
-#### Member 3: Frontend lead (medium-high)
-
-- Own main dashboards and subscription UX flows.
-- Integrate frontend with backend endpoints.
-- Ensure loading/error states are demo-safe and understandable.
-
-#### Member 4: Frontend support engineer (medium)
-
-- Implement secondary pages and reusable UI components.
-- Improve responsiveness and visual consistency.
-- Support history, usage, and detail views.
-
-#### Member 5: Edge terminal and NFC engineer (medium-low)
-
-- Own edge terminal event flow and backend posting reliability.
-- Implement fallback simulation for demos without physical NFC.
-- Ensure tap-in/tap-out events are reproducible for testing.
-
-#### Member 6: QA and validation owner (low-medium)
-
-- Own end-to-end validation checklist for gym and streaming.
-- Run regression tests after merges to main.
-- File bugs with clear reproduction steps and expected/actual results.
-
-#### Member 7: Documentation and demo operations (low-medium)
-
-- Own README/runbook quality and onboarding clarity.
-- Maintain demo script, environment checklist, and troubleshooting updates.
-- Ensure each merged feature has matching documentation notes.
-
-### Delivery timeline (recommended)
-
-1. Day 1: lock backend API contracts and start frontend integration.
-2. Day 2: complete core features and start full regression testing.
-3. Day 3: stabilize settlement/payment flow, polish UI and docs.
-4. Demo day: freeze changes, run final checklist, execute scripted demo.
-
-### How to reset local state for clean demos
-
-If you need a fresh DB state for demo runs:
-
-```bash
-docker-compose down -v
-docker-compose up -d
-```
-
-Then re-run app and resubscribe test users.
+Click the **"Add name ✎"** label on any row to assign a customer name. Names persist to the database and appear on all future history entries for that customer.
 
 ---
 
 ## API Reference
 
-### Gym APIs
-
-| Method | Path | Body / Params | Description |
-|--------|------|---------------|-------------|
-| POST | /api/gym/tap-in | { uid, terminalId? } | Record gym entry |
-| POST | /api/gym/tap-out | { uid, terminalId? } | Record gym exit |
-| GET | /api/gym/session/:uid | - | Live session status and estimated charge |
-| POST | /api/gym/subscribe | { walletAddress, nfcUid, subscriptionType, tier } | Start GNAP flow and create subscription |
-| GET | /api/gym/subscriptions/:uid | - | Active subscriptions |
-| GET | /api/gym/pricing | - | Gym pricing constants |
-| GET | /api/gym/history/:uid | - | Recent daily settlements |
-| POST | /api/gym/pos/incoming-payment | { durationKey } | Create incoming payment for POS pass; returns paymentUrl + logs |
-| GET | /api/gym/pos/payment-status/:incomingPaymentId | - | Poll incoming payment status (pending / completed) |
-
-### Streaming APIs
-
-| Method | Path | Body / Params | Description |
-|--------|------|---------------|-------------|
-| POST | /api/stream/start | { uid, contentId, contentTitle?, contentType? } | Start stream session |
-| POST | /api/stream/end | { sessionId } | End stream session |
-| GET | /api/stream/session/:uid | - | Current session + daily usage |
-| POST | /api/stream/subscribe | { walletAddress, nfcUid, subscriptionType, tier } | Subscribe for streaming |
-| GET | /api/stream/subscriptions/:uid | - | Active subscriptions |
-| GET | /api/stream/pricing | - | Streaming pricing constants |
-
-### Grants and Payments APIs
+### PavelFlow (streaming gym sessions)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | /api/grants/initiate | Start wallet authorization flow |
-| GET | /api/grants/callback | Complete interactive GNAP callback |
-| POST | /api/trigger-payment | Legacy one-shot payment endpoint |
-| GET | /api/transactions | Payment history by wallet address |
-| GET | /jwks.json | Public JWKS for signature verification |
+| POST | `/api/gym/flow/start` | Create a new session; returns entry QR URL |
+| GET | `/api/gym/flow/entry-page?token=` | HTML page for customer to confirm wallet |
+| POST | `/api/gym/flow/confirm-entry` | Save wallet address; activates session |
+| GET | `/api/gym/flow/active` | All currently streaming sessions with live totals |
+| GET | `/api/gym/flow/history` | All completed/cancelled sessions |
+| GET | `/api/gym/flow/exit-page?token=` | HTML exit page with live timer + pay button |
+| POST | `/api/gym/flow/init-exit-payment` | Calculate amount + create Open Payments consent |
+| GET | `/api/gym/flow/exit-callback` | Wallet redirect callback — finalizes payment + closes session |
+| POST | `/api/gym/flow/exit` | Direct close without payment (fallback / testing) |
+| POST | `/api/gym/flow/name` | Assign a display name to a FlowSession |
 
-### Development-only API
+### Gym (NFC + subscriptions)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | /api/dev/settle-now | Trigger settlement instantly (skip midnight wait) |
+| POST | `/api/gym/tap-in` | Record gym entry |
+| POST | `/api/gym/tap-out` | Record gym exit |
+| GET | `/api/gym/session/:uid` | Live session status + estimated charge |
+| GET | `/api/gym/sessions/:uid` | Today's tap-in/tap-out records for a UID |
+| GET | `/api/gym/visits` | All GymSessions across all dates (with member name) |
+| POST | `/api/gym/subscribe` | Start GNAP flow + create subscription |
+| GET | `/api/gym/subscriptions/:uid` | Active subscriptions |
+| GET | `/api/gym/pricing` | Pricing constants |
+| GET | `/api/gym/history/:uid` | Settlement history for a UID |
+| POST | `/api/gym/members/name` | Save / update member display name by NFC UID |
+
+### POS Terminal
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/gym/pos/incoming-payment` | Create incoming payment; returns QR-ready pay-page URL |
+| GET | `/api/gym/pos/payment-status/:id` | Poll payment status (pending / completed) |
+| GET | `/api/gym/pos/pay-page` | Customer-facing HTML: enter wallet + confirm |
+| POST | `/api/gym/pos/pay` | Create quote + interactive grant; returns wallet consent URL |
+| GET | `/api/gym/pos/pay/callback` | Wallet redirect callback — finalizes outgoing payment |
+
+### Streaming (PavelFlix)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/stream/start` | Start stream session |
+| POST | `/api/stream/end` | End stream session |
+| GET | `/api/stream/session/:uid` | Current session + daily usage |
+| POST | `/api/stream/subscribe` | Subscribe for streaming |
+| GET | `/api/stream/pricing` | Streaming pricing constants |
+
+### Grants + Payments
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/grants/initiate` | Start wallet authorization |
+| GET | `/api/grants/callback` | Complete GNAP callback |
+| GET | `/api/transactions` | Payment history |
+| POST | `/api/dev/settle-now` | Trigger settlement immediately (dev only) |
 
 ---
 
 ## Troubleshooting
 
-### Backend fails to start
+### Exit QR payment fails to reach the customer's phone
 
-- Confirm .env exists and has correct DB and wallet values.
-- Confirm keys/private.key and keys/public.json exist.
-- Check if port 4001 is already in use.
+- The backend must be publicly reachable. Set `PUBLIC_BASE_URL=https://your-ngrok-url.io` in `.env` and restart.
+- The customer's phone and the backend must use the same URL for the callback.
 
-### Wallet approval succeeds but subscription remains inactive
+### "Session not found" on exit QR scan
 
-- Verify BACKEND_PUBLIC_URL is reachable and matches callback URL.
-- Verify KEY_ID matches the uploaded developer key.
-- Check grant callback logs for interact_ref handling errors.
+- QR codes are single-use and tied to a specific session. If the session was already closed (status ≠ streaming), the exit page shows a summary instead.
 
-### Settlement writes skipped unexpectedly
+### Wallet approval succeeds but subscription stays inactive
 
-- For dynamic plans, skipped means usage for that day was zero.
-- Verify sessions are correctly closed (tap-out or stream-end happened).
-- Confirm the test user actually has an active mandate/subscription.
+- Verify `BACKEND_PUBLIC_URL` is the correct callback origin.
+- Verify `KEY_ID` matches the developer key uploaded to the testnet wallet.
 
-### Docker issues
+### Settlement shows `skipped` for all users
 
-- Run docker-compose ps and inspect unhealthy/exited containers.
-- If state is corrupted, reset:
+- Skipped = zero usage for that day on a dynamic plan. Confirm tap-in/tap-out events were recorded.
+- Confirm the user has an active mandate (subscription was approved through GNAP).
+
+### Docker / DB issues
 
 ```bash
 docker-compose down -v
@@ -704,72 +569,78 @@ docker-compose up -d
 
 ## Developer Notes
 
-### Important backend files
+### PavelFlix vs PavelFlow — two different payment paths
 
-- apps/core-backend/src/services/billing.js
-  - All pricing formulas and charge calculations.
-- apps/core-backend/src/services/gym-session.js
-  - Gym session open/close logic.
-- apps/core-backend/src/services/streaming-session.js
-  - Streaming session open/close logic.
-- apps/core-backend/src/services/settlement.js
-  - Daily settlement scheduler and payment orchestration.
-- apps/core-backend/src/services/pos-payment.js
-  - POS incoming payment creation and status polling. Adapted from OpenRemit quoteFlow.ts (steps 1–3 only). Uses an in-memory Map to store access tokens between creation and status polls.
-- apps/core-backend/src/services/pos-open-payments.js
-  - normaliseWalletAddress and isFinalizedGrant helpers. Adapted from OpenRemit openPayments.ts.
-- apps/core-backend/src/controllers/grantController.js
-  - GNAP callback finalization.
+| | PavelFlix (video) | PavelFlow (gym) |
+|--|-------------------|-----------------|
+| **Standard** | Web Monetization v2 (`<link rel="monetization">`) | Open Payments GNAP |
+| **Payment path** | Browser → ILP → merchant wallet directly | Backend orchestrates incoming payment + outgoing payment consent |
+| **Backend in payment path?** | No | Yes |
+| **Timing** | Continuous sub-cent micropayments while playing | One transaction at exit |
+| **Settlement** | Midnight writes history record only — money already moved via WM | Immediate at tap-out |
+| **Fallback (no WM agent)** | Demo ticker at 12¢/min | N/A |
+| **Key hook / service** | `useWebMonetization.ts` | `pos-payment.js` + `initFlowExitPayment` |
 
-### Open Payments SDK usage pattern
+### Key files
 
-```js
-const client = await createAuthenticatedClient({
-  walletAddressUrl,
-  keyId,
-  privateKey: keyConfig.privateKeyBuffer,
-});
+| File | Purpose |
+|------|---------|
+| `gymController.js` | All gym + PavelFlow endpoints and payment orchestration |
+| `models/index.js` | Sequelize models — `User` (with `name`), `GymSession`, `FlowSession` (with `name`), `DailySettlement` |
+| `services/pos-payment.js` | `createPOSIncomingPayment`, `createPaymentConsent`, `finalizePaymentConsent` |
+| `services/settlement.js` | Midnight cron — settles GymSessions and StreamSessions only (PavelFlow settles at exit) |
+| `services/billing.js` | All charge formulas |
+| `pages/POSDashboard.tsx` | Front desk: POS pass QR + PavelFlow session start |
+| `pages/GymHistory.tsx` | Live sessions, all-time history, exit QR modal, name editor |
 
-const wallet = await client.walletAddress.get({ url: walletAddressUrl });
+### PavelFlow data model
 
-const pendingGrant = await client.grant.request({ url: wallet.authServer }, {
-  access_token: { access: [/* outgoing-payment access */] },
-  interact: {
-    start: ['redirect'],
-    finish: { method: 'redirect', uri: callbackUrl, nonce },
-  },
-});
-
-const finalGrant = await client.grant.continue(
-  {
-    url: pendingGrant.continue.uri,
-    accessToken: pendingGrant.continue.access_token.value,
-  },
-  { interact_ref },
-);
-
-await client.outgoingPayment.create(
-  { url: wallet.resourceServer, accessToken: finalGrant.access_token.value },
-  {
-    walletAddress: wallet.id,
-    incomingAmount: { value: '600', assetCode: 'USD', assetScale: 2 },
-  },
-);
+```
+FlowSession {
+  id            UUID PK
+  walletAddress STRING    — "pending" until confirmed via entry page
+  name          STRING    — optional display name set from History page
+  entryToken    STRING 64 — embedded in entry QR (single-use)
+  exitToken     STRING 64 — embedded in exit QR (single-use)
+  status        ENUM      — streaming | completed | cancelled
+  tapInAt       DATE
+  tapOutAt      DATE
+  totalCents    INTEGER   — final charge (set at exit)
+  currency      STRING 3
+  ratePerMinuteCents INTEGER  — default 50 ($0.50/min)
+}
 ```
 
-### Settlement summary
+### Open Payments flow (two-step exit payment)
 
-`runDailySettlement()` executes at 00:00 via node-cron and performs:
+```
+POST /init-exit-payment
+  1. Calculate totalCents (with daily cap)
+  2. createPOSIncomingPayment(totalCents)  → incomingPaymentId
+  3. createPaymentConsent(incomingPaymentId, walletAddress)
+     → quote on customer wallet
+     → interactive outgoing-payment grant
+     → returns interactUrl
 
-1. Load active subscriptions due for billing.
-2. Close any open sessions for the day.
-3. Aggregate usage minutes.
-4. Compute charge via billing engine.
-5. Create outgoing payment when charge applies.
-6. Persist DailySettlement and Transaction records.
+GET /exit-callback?payId=&exitToken=&totalCents=&interact_ref=
+  4. finalizePaymentConsent(payId, interact_ref)
+     → grant.continue() → access_token
+     → outgoingPayment.create() — money moves
+  5. FlowSession.update({ status: completed, totalCents })
+```
 
-For faster testing, call:
+### Branching convention
+
+```
+feat/<feature>    new functionality
+fix/<bug>         bug fix
+chore/<task>      maintenance / docs
+```
+
+Before merging: `git fetch origin && git merge origin/main`
+
+### Reset local state for a clean demo
 
 ```bash
-curl -X POST http://localhost:4001/api/dev/settle-now
+docker-compose down -v && docker-compose up -d
 ```

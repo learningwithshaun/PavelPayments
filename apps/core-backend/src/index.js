@@ -36,6 +36,7 @@ app.get("/api/transactions", transactionController.listTransactions);
 app.post("/api/gym/tap-in", gymController.tapIn);
 app.post("/api/gym/tap-out", gymController.tapOut);
 app.get("/api/gym/session/:uid", gymController.getSession);
+app.get("/api/gym/sessions/:uid", gymController.getTodaySessions);
 app.post("/api/gym/subscribe", gymController.subscribe);
 app.get("/api/gym/subscriptions/:uid", gymController.listSubscriptions);
 app.get("/api/gym/pricing", gymController.getPricing);
@@ -47,6 +48,23 @@ app.get("/api/gym/pos/payment-status/:incomingPaymentId", gymController.getPOSPa
 app.get("/api/gym/pos/pay-page", gymController.getPOSPayPage);
 app.post("/api/gym/pos/pay", gymController.startPOSPayment);
 app.get("/api/gym/pos/pay/callback", gymController.posPaymentCallback);
+
+// ── PavelFlow routes (streaming gym sessions) ─────────────────────────────────
+app.post("/api/gym/flow/check-balance",  gymController.checkFlowBalance);
+app.post("/api/gym/flow/start",          gymController.startFlow);
+app.get("/api/gym/flow/active",          gymController.listActiveFlows);
+app.get("/api/gym/flow/entry-page",      gymController.getFlowEntryPage);
+app.post("/api/gym/flow/confirm-entry",  gymController.confirmEntry);
+app.get("/api/gym/flow/exit-page",       gymController.getFlowExitPage);
+app.post("/api/gym/flow/exit",           gymController.exitFlow);
+app.post("/api/gym/flow/init-exit-payment", gymController.initFlowExitPayment);
+app.get("/api/gym/flow/exit-callback",   gymController.flowExitCallback);
+app.get("/api/gym/flow/history",         gymController.getFlowHistory);
+app.post("/api/gym/flow/name",           gymController.saveFlowName);
+
+// ── Member / persistent history routes ────────────────────────────────────────
+app.get("/api/gym/visits",               gymController.getAllVisits);
+app.post("/api/gym/members/name",        gymController.saveMemberName);
 
 // ── Streaming routes ──────────────────────────────────────────────────────────
 app.post("/api/stream/start", streamingController.startStream);

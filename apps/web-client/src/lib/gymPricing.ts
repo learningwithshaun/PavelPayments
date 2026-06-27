@@ -15,24 +15,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type Mode = "payg" | "member";
-export type Tier = "30min" | "1hr" | "2hr" | "day" | "weekly" | "monthly" | "yearly";
+export type Tier = "day" | "stream" | "weekly" | "monthly" | "yearly";
 
 export interface Pass {
   key: Tier;
   label: string;
-  /** Amount charged upfront at the till, in cents (matches backend POS_PASSES). */
+  /** Amount charged upfront at the till, in cents (matches backend POS_PASSES). 0 for streaming passes. */
   upfrontCents: number;
   note: string;
   icon: string;
   /** Billing days the upfront covers — used to derive the daily base for members. */
   days: number;
+  /** True for web-monetization style passes — no fixed amount, streams until tap-out. */
+  streaming?: boolean;
 }
 
 export const PAY_AS_YOU_GO: Pass[] = [
-  { key: "30min", label: "30 minutes", upfrontCents: 1500, note: "Quick visit",     icon: "⏱️", days: 1 },
-  { key: "1hr",   label: "1 hour",     upfrontCents: 3000, note: "Most popular",    icon: "🔥", days: 1 },
-  { key: "2hr",   label: "2 hours",    upfrontCents: 5000, note: "Best value",      icon: "💪", days: 1 },
-  { key: "day",   label: "Day pass",   upfrontCents: 6000, note: "All-day access",  icon: "☀️", days: 1 },
+  { key: "day",    label: "Day Pass",   upfrontCents: 6000, note: "All-day access — paid upfront", icon: "☀️", days: 1 },
+  { key: "stream", label: "PavelFlow",  upfrontCents: 0,    note: "Streams until you tap out",    icon: "〰️", days: 1, streaming: true },
 ];
 
 export const MEMBERSHIPS: Pass[] = [

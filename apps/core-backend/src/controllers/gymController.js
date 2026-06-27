@@ -576,4 +576,536 @@ async function posPaymentCallback(req, res) {
   }
 }
 
-module.exports = { tapIn, tapOut, getSession, subscribe, listSubscriptions, getPricing, getHistory, createPOSPayment, getPOSPaymentStatus, getPOSPayPage, startPOSPayment, posPaymentCallback };
+/**
+ * GET /api/gym/sessions/:uid
+ * Returns all GymSessions for the given NFC UID for today's date.
+ * Used by the History page to show live activity before the midnight settlement cron runs.
+ */
+async function getTodaySessions(req, res) {
+  const { uid } = req.params;
+  if (!uid) return res.status(400).json({ error: 'uid is required' });
+  try {
+    const { User, GymSession } = require('../models');
+    const user = await User.findOne({ where: { nfcUid: uid } });
+    if (!user) return res.json({ sessions: [], user: null });
+    const today = new Date().toISOString().slice(0, 10);
+    const sessions = await GymSession.findAll({
+      where: { userId: user.id, date: today },
+      order: [['tapInAt', 'DESC']],
+    });
+    res.json({ sessions, user: { nfcUid: user.nfcUid, name: user.name ?? null, walletAddress: user.walletAddress } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ── All Gym Visits (persistent history) ───────────────────────────────────────
+/**
+ * GET /api/gym/visits?limit=50&offset=0
+ * Returns all GymSessions across all dates, most recent first, with member name.
+ */
+async function getAllVisits(req, res) {
+  try {
+    const { GymSession, User } = require('../models');
+    const limit  = Math.min(Number(req.query.limit  ?? 50), 200);
+    const offset = Number(req.query.offset ?? 0);
+    const sessions = await GymSession.findAll({
+      include: [{ model: User, attributes: ['nfcUid', 'name', 'walletAddress'] }],
+      order: [['tapInAt', 'DESC']],
+      limit,
+      offset,
+    });
+    const total = await GymSession.count();
+    res.json({ sessions, total });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ── PavelFlow history (completed sessions) ─────────────────────────────────────
+/**
+ * GET /api/gym/flow/history?limit=50&offset=0
+ * Returns completed / cancelled FlowSessions, most recent first.
+ */
+async function getFlowHistory(req, res) {
+  try {
+    const { FlowSession } = require('../models');
+    const limit  = Math.min(Number(req.query.limit  ?? 50), 200);
+    const offset = Number(req.query.offset ?? 0);
+    const { Op } = require('sequelize');
+    const sessions = await FlowSession.findAll({
+      where: { status: { [Op.in]: ['completed', 'cancelled'] } },
+      order: [['tapInAt', 'DESC']],
+      limit,
+      offset,
+    });
+    const total = await FlowSession.count({ where: { status: { [Op.in]: ['completed', 'cancelled'] } } });
+    res.json({ sessions, total });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ── Save member name ───────────────────────────────────────────────────────────
+/**
+ * POST /api/gym/members/name
+ * Body: { uid, name }  — saves / updates the display name for an NFC UID.
+ */
+async function saveMemberName(req, res) {
+  const { uid, name } = req.body ?? {};
+  if (!uid || typeof uid !== 'string') return res.status(400).json({ error: 'uid required' });
+  if (typeof name !== 'string')         return res.status(400).json({ error: 'name required' });
+  try {
+    const [user, created] = await User.findOrCreate({
+      where: { nfcUid: uid },
+      defaults: { nfcUid: uid, name: name.trim() },
+    });
+    if (!created) await user.update({ name: name.trim() });
+    res.json({ ok: true, user: { nfcUid: user.nfcUid, name: user.name } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ── Save PavelFlow session name ────────────────────────────────────────────────
+/**
+ * POST /api/gym/flow/name
+ * Body: { sessionId, name }  — saves a display name on a FlowSession row.
+ */
+async function saveFlowName(req, res) {
+  const { sessionId, name } = req.body ?? {};
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+  if (typeof name !== 'string') return res.status(400).json({ error: 'name required' });
+  try {    const { FlowSession } = require('../models');    const session = await FlowSession.findByPk(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    await session.update({ name: name.trim() });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ── PavelFlow exit — Open Payments step 1: create consent ────────────────────
+/**
+ * POST /api/gym/flow/init-exit-payment
+ * Body: { exitToken }
+ * Calculates the amount owed (with daily cap), creates a merchant incoming
+ * payment, then creates an interactive outgoing-payment consent on the
+ * customer's wallet. Returns { interactUrl, totalCents } to redirect the phone.
+ */
+async function initFlowExitPayment(req, res) {
+  const { exitToken } = req.body ?? {};
+  if (!exitToken) return res.status(400).json({ error: 'exitToken is required' });
+  try {
+    const { FlowSession } = require('../models');
+    const { Op } = require('sequelize');
+    const session = await FlowSession.findOne({ where: { exitToken: String(exitToken) } });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (session.status !== 'streaming') {
+      return res.status(409).json({ error: 'Session already ended', totalCents: session.totalCents });
+    }
+    // Wallet must be confirmed before we can charge it
+    if (!session.walletAddress || session.walletAddress === 'pending') {
+      return res.status(400).json({ error: 'Wallet address not yet confirmed for this session' });
+    }
+
+    // Calculate amount with per-day cap
+    const now = new Date();
+    const elapsedMs      = now.getTime() - new Date(session.tapInAt).getTime();
+    const elapsedMinutes = Math.ceil(elapsedMs / 60000);
+    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+    const alreadyToday = (await FlowSession.sum('totalCents', {
+      where: {
+        walletAddress: session.walletAddress,
+        status: 'completed',
+        tapOutAt: { [Op.gte]: startOfDay },
+        id: { [Op.ne]: session.id },
+      },
+    })) ?? 0;
+    const remainingCap = Math.max(0, FLOW_MAX_DAILY_CENTS - alreadyToday);
+    const totalCents   = Math.min(elapsedMinutes * session.ratePerMinuteCents, remainingCap);
+
+    // Already hit the daily cap — close without charging
+    if (totalCents === 0) {
+      await session.update({ tapOutAt: now, totalCents: 0, status: 'completed' });
+      return res.json({ ok: true, totalCents: 0, alreadyCapped: true });
+    }
+
+    const currency = process.env.PAYMENT_CURRENCY ?? 'USD';
+    const posPaymentService = require('../services/pos-payment');
+
+    // Step 1: incoming payment on merchant wallet
+    const ipResult = await posPaymentService.createPOSIncomingPayment({
+      amountCents: totalCents,
+      currency,
+      description: `PavelFlow — ${elapsedMinutes} min at PavelGym`,
+    });
+
+    // Step 2: quote + interactive consent on customer wallet
+    const base = posBaseUrl(req);
+    const { payId, interactUrl } = await posPaymentService.createPaymentConsent({
+      incomingPaymentId:      ipResult.incomingPaymentId,
+      customerWalletAddress:  session.walletAddress,
+      buildCallbackUrl: (pid) =>
+        `${base}/api/gym/flow/exit-callback` +
+        `?payId=${encodeURIComponent(pid)}` +
+        `&exitToken=${encodeURIComponent(String(exitToken))}` +
+        `&totalCents=${totalCents}`,
+    });
+
+    res.json({ ok: true, payId, interactUrl, totalCents, elapsedMinutes, currency });
+  } catch (err) {
+    console.error('[gym/flow/init-exit-payment]', err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ── PavelFlow exit — Open Payments step 2: wallet callback ───────────────────
+/**
+ * GET /api/gym/flow/exit-callback
+ * The customer's wallet redirects here after they approve (or decline) payment.
+ * Finalises the outgoing payment and marks the FlowSession completed.
+ */
+async function flowExitCallback(req, res) {
+  const { payId, exitToken, totalCents, interact_ref, result } = req.query;
+  res.set('Content-Type', 'text/html; charset=utf-8');
+
+  if (result === 'grant_rejected' || !interact_ref) {
+    return res.status(200).send(_resultPage(false, 'Payment declined',
+      'You declined the payment at your wallet. Scan the exit QR again to try once more.'));
+  }
+  try {
+    const { FlowSession } = require('../models');
+    const posPaymentService = require('../services/pos-payment');
+
+    // Finalise the outgoing payment (money moves here)
+    await posPaymentService.finalizePaymentConsent({
+      payId: String(payId),
+      interactRef: String(interact_ref),
+    });
+
+    // Mark session completed
+    const session = await FlowSession.findOne({ where: { exitToken: String(exitToken) } });
+    if (session && session.status === 'streaming') {
+      await session.update({ tapOutAt: new Date(), totalCents: Number(totalCents), status: 'completed' });
+    }
+
+    const charged = (Number(totalCents) / 100).toFixed(2);
+    res.status(200).send(_resultPage(true, 'Stream settled!',
+      `$${charged} charged successfully. Thanks for training at PavelGym! 🏋️`));
+  } catch (err) {
+    console.error('[gym/flow/exit-callback]', err);
+    res.status(200).send(_resultPage(false, 'Payment failed', err.message));
+  }
+}
+
+module.exports = { tapIn, tapOut, getSession, subscribe, listSubscriptions, getPricing, getHistory, getTodaySessions, createPOSPayment, getPOSPaymentStatus, getPOSPayPage, startPOSPayment, posPaymentCallback, checkFlowBalance, startFlow, listActiveFlows, getFlowEntryPage, confirmEntry, getFlowExitPage, exitFlow, initFlowExitPayment, flowExitCallback, getAllVisits, getFlowHistory, saveMemberName, saveFlowName };
+
+// ── PavelFlow — web-monetization-style streaming gym sessions ─────────────────
+
+const FLOW_RATE_PER_MINUTE_CENTS = 50;   // $0.50 / min
+const FLOW_MAX_DAILY_CENTS       = 6000; // $60.00 cap — same as Day Pass
+
+/**
+ * POST /api/gym/flow/check-balance
+ * Body: { walletAddress }
+ * Resolves the customer's wallet address via Open Payments to confirm it exists.
+ * (A true balance query requires a customer-issued grant, which we can't do pre-entry.
+ *  The wallet address resolution at least verifies the wallet is reachable and tells
+ *  us its asset currency — the wallet's own app will block the payment if funds are low.)
+ */
+async function checkFlowBalance(req, res) {
+  const { walletAddress } = req.body ?? {};
+  if (!walletAddress || typeof walletAddress !== 'string') {
+    return res.status(400).json({ ok: false, reason: 'walletAddress is required' });
+  }
+  try {
+    const { normaliseWalletAddress } = require('../services/pos-open-payments');
+    const { getClient } = require('../services/open-payments');
+    const url = normaliseWalletAddress(walletAddress.trim());
+    const client = await getClient();
+    const wallet = await client.walletAddress.get({ url });
+    res.json({
+      ok: true,
+      walletInfo: { id: wallet.id, assetCode: wallet.assetCode, assetScale: wallet.assetScale },
+      maxChargeCents: FLOW_MAX_DAILY_CENTS,
+      ratePerMinuteCents: FLOW_RATE_PER_MINUTE_CENTS,
+    });
+  } catch (err) {
+    res.json({ ok: false, reason: `Wallet not found or unreachable: ${err.message}` });
+  }
+}
+
+/**
+ * POST /api/gym/flow/start
+ * No body required — wallet is collected on the customer's phone via the entry-page QR.
+ * Creates a FlowSession immediately and returns the entry QR URL.
+ */
+async function startFlow(req, res) {
+  try {
+    const { FlowSession } = require('../models');
+    const crypto = require('crypto');
+    const entryToken = crypto.randomBytes(32).toString('hex');
+    const exitToken  = crypto.randomBytes(32).toString('hex');
+    const session = await FlowSession.create({
+      walletAddress: 'pending', // filled in by the customer on their phone
+      entryToken,
+      exitToken,
+      tapInAt: new Date(),
+      status: 'streaming',
+      ratePerMinuteCents: FLOW_RATE_PER_MINUTE_CENTS,
+      currency: process.env.PAYMENT_CURRENCY ?? 'USD',
+    });
+    const base = posBaseUrl(req);
+    res.json({
+      sessionId: session.id,
+      entryQrUrl: `${base}/api/gym/flow/entry-page?token=${entryToken}`,
+      tapInAt: session.tapInAt,
+      ratePerMinuteCents: session.ratePerMinuteCents,
+      maxDailyCents: FLOW_MAX_DAILY_CENTS,
+    });
+  } catch (err) {
+    console.error('[gym/flow/start]', err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+/**
+ * GET /api/gym/flow/active
+ * Returns all currently-streaming FlowSessions with live running totals.
+ */
+async function listActiveFlows(req, res) {
+  try {
+    const { FlowSession } = require('../models');
+    const sessions = await FlowSession.findAll({
+      where: { status: 'streaming' },
+      order: [['tapInAt', 'ASC']],
+    });
+    const base = posBaseUrl(req);
+    const now  = Date.now();
+    res.json({
+      sessions: sessions.map(s => {
+        const elapsedMs      = now - new Date(s.tapInAt).getTime();
+        const elapsedMinutes = Math.ceil(elapsedMs / 60000);
+        const runningCents   = Math.min(elapsedMinutes * s.ratePerMinuteCents, FLOW_MAX_DAILY_CENTS);
+        return {
+          id: s.id,
+          walletAddress: s.walletAddress,
+          tapInAt: s.tapInAt,
+          elapsedMinutes,
+          runningCents,
+          currency: s.currency,
+          ratePerMinuteCents: s.ratePerMinuteCents,
+          exitQrUrl: `${base}/api/gym/flow/exit-page?token=${s.exitToken}`,
+        };
+      }),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+/**
+ * GET /api/gym/flow/entry-page?token=...
+ * Mobile HTML page shown after the customer scans the entry QR.
+ */
+async function getFlowEntryPage(req, res) {
+  const { token } = req.query;
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  if (!token) return res.status(400).send(_resultPage(false, 'Invalid QR', 'Missing session token.'));
+  try {
+    const { FlowSession } = require('../models');
+    const session = await FlowSession.findOne({ where: { entryToken: String(token) } });
+    if (!session) return res.status(404).send(_resultPage(false, 'Session not found', 'This QR has already been used or is invalid.'));
+    const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const tokenJson = JSON.stringify(String(token));
+    res.send(`<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PavelFlow — Entry</title><style>${_payPageStyles}</style></head>
+<body><div class="card">
+  <div class="brand">PavelFlow · Web Monetization</div>
+  <div class="label">Rate</div>
+  <div class="amount" style="font-size:24px">$${(FLOW_RATE_PER_MINUTE_CENTS/100).toFixed(2)}<span style="font-size:13px;color:#9ca3af">/min &nbsp;·&nbsp; max $${(FLOW_MAX_DAILY_CENTS/100).toFixed(2)}/day</span></div>
+  <form id="f">
+    <label for="w">Your Interledger wallet address</label>
+    <input id="w" autocomplete="off" autocapitalize="none" spellcheck="false"
+      placeholder="https://ilp.interledger-test.dev/you" required>
+    <div id="chk" style="margin-top:10px;font-size:12px;color:#6b7280;min-height:18px"></div>
+    <button id="btn" type="submit">✓ Start streaming</button>
+    <div class="err" id="e"></div>
+    <div class="hint">Micropayments stream from your wallet while you train. Scan the exit QR at the front desk when done.</div>
+  </form>
+  <div id="msg"></div>
+</div>
+<script>
+  var f=document.getElementById('f'),btn=document.getElementById('btn'),e=document.getElementById('e'),chk=document.getElementById('chk'),w=document.getElementById('w');
+  w.addEventListener('blur',async function(){
+    var v=w.value.trim(); if(!v) return;
+    chk.textContent='Checking wallet...'; chk.style.color='#6b7280';
+    try{
+      var r=await fetch('/api/gym/flow/check-balance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({walletAddress:v})});
+      var d=await r.json();
+      if(d.ok){chk.textContent='✓ Wallet valid ('+d.walletInfo.assetCode+')';chk.style.color='#4ade80';}
+      else{chk.textContent='⚠ '+d.reason;chk.style.color='#f87171';}
+    }catch(ex){chk.textContent='';}
+  });
+  f.addEventListener('submit',async function(ev){
+    ev.preventDefault();
+    var walletAddress=w.value.trim();
+    e.textContent=''; btn.disabled=true; btn.textContent='Checking in...';
+    try{
+      var r=await fetch('/api/gym/flow/confirm-entry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entryToken:${tokenJson},walletAddress:walletAddress})});
+      var d=await r.json();
+      if(!r.ok) throw new Error(d.error||'Failed');
+      f.style.display='none';
+      document.getElementById('msg').innerHTML='<div style="text-align:center;padding-top:16px"><div style="font-size:56px">&#x2705;</div><h1 style="font-size:22px;margin:10px 0 6px;color:#4ade80">You are in!</h1><p style="color:#9ca3af;font-size:14px">Session started &#8212; enjoy your workout!<br>Scan the exit QR at the front desk when done.</p></div>';
+    }catch(ex){e.textContent=ex.message;btn.disabled=false;btn.textContent='✓ Start streaming';}
+  });
+</script></body></html>`);
+  } catch (err) {
+    res.status(500).send(_resultPage(false, 'Error', err.message));
+  }
+}
+
+/**
+ * POST /api/gym/flow/confirm-entry
+ * Body: { entryToken, walletAddress }
+ * Saves the customer's wallet address and confirms the entry.
+ */
+async function confirmEntry(req, res) {
+  const { entryToken, walletAddress } = req.body ?? {};
+  if (!entryToken) return res.status(400).json({ error: 'entryToken is required' });
+  if (!walletAddress) return res.status(400).json({ error: 'walletAddress is required' });
+  try {
+    const { FlowSession } = require('../models');
+    const session = await FlowSession.findOne({ where: { entryToken: String(entryToken), status: 'streaming' } });
+    if (!session) return res.status(404).json({ error: 'Session not found or already ended' });
+    await session.update({ walletAddress: walletAddress.trim() });
+    res.json({ ok: true, sessionId: session.id, tapInAt: session.tapInAt });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+/**
+ * GET /api/gym/flow/exit-page?token=...
+ * Mobile HTML page shown after the customer scans the exit QR.
+ * Shows live elapsed time + running total, and a Confirm Exit button.
+ */
+async function getFlowExitPage(req, res) {
+  const { token } = req.query;
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  if (!token) return res.status(400).send(_resultPage(false, 'Invalid QR', 'Missing session token.'));
+  try {
+    const { FlowSession } = require('../models');
+    const session = await FlowSession.findOne({ where: { exitToken: String(token) } });
+    if (!session) return res.status(404).send(_resultPage(false, 'Session not found', 'This exit QR is invalid.'));
+    if (session.status !== 'streaming') {
+      return res.send(_resultPage(true, 'Already checked out', `Total charged: $${(session.totalCents/100).toFixed(2)}. Thanks for training at PavelGym!`));
+    }
+    const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const shortWallet = session.walletAddress.replace(/^https?:\/\//, '').slice(0, 42);
+    res.send(`<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PavelFlow — Exit</title><style>${_payPageStyles}</style></head>
+<body><div class="card">
+  <div class="brand">PavelFlow · Check-out</div>
+  <div class="label">Wallet</div>
+  <div style="font-size:13px;color:#9ca3af;margin-bottom:16px;word-break:break-all">${esc(shortWallet)}</div>
+  <div class="label">Time trained</div>
+  <div class="amount" style="font-size:28px" id="elapsed">—</div>
+  <div class="label">Amount to settle</div>
+  <div class="amount" id="total">—</div>
+  <div id="msg"></div>
+  <button id="btn" onclick="pay_and_exit()">Pay & Exit — authorise in your wallet</button>
+  <div class="hint">You'll be redirected to your Interledger wallet to approve the exact amount.
+    No more will be taken after you confirm.</div>
+</div>
+<script>
+  var tapInAt=new Date(${JSON.stringify(new Date(session.tapInAt).toISOString())});
+  var rate=${FLOW_RATE_PER_MINUTE_CENTS}, maxCents=${FLOW_MAX_DAILY_CENTS};
+  function update(){
+    var ms=Date.now()-tapInAt.getTime();
+    var m=Math.ceil(ms/60000), s=Math.floor((ms%60000)/1000);
+    document.getElementById('elapsed').textContent=m+'m '+String(s).padStart(2,'0')+'s';
+    var c=Math.min(m*rate,maxCents);
+    document.getElementById('total').textContent='$'+(c/100).toFixed(2);
+  }
+  update(); setInterval(update,1000);
+  async function pay_and_exit(){
+    var btn=document.getElementById('btn'), msg=document.getElementById('msg');
+    btn.disabled=true; btn.textContent='Preparing payment…';
+    try {
+      var r=await fetch('/api/gym/flow/init-exit-payment',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({exitToken:${JSON.stringify(String(token))}})
+      });
+      var d=await r.json();
+      if(!r.ok) throw new Error(d.error||'Failed to initiate payment');
+      if(d.alreadyCapped){
+        btn.textContent='✅ Done — daily cap reached!';
+        msg.innerHTML='<p style="color:#4ade80;margin-top:12px;font-size:15px">You already reached the $'+(${FLOW_MAX_DAILY_CENTS}/100).toFixed(2)+' daily max earlier today. No charge for this session.</p>';
+        return;
+      }
+      // Redirect to wallet consent page
+      window.location.href = d.interactUrl;
+    } catch(e){
+      btn.disabled=false; btn.textContent='Pay & Exit — authorise in your wallet';
+      msg.innerHTML='<p style="color:#f87171;margin-top:8px">'+e.message+'</p>';
+    }
+  }
+</script></body></html>`);
+  } catch (err) {
+    res.status(500).send(_resultPage(false, 'Error', err.message));
+  }
+}
+
+/**
+ * POST /api/gym/flow/exit
+ * Body: { exitToken }
+ * Ends the streaming session and calculates the final total.
+ */
+async function exitFlow(req, res) {
+  const { exitToken } = req.body ?? {};
+  if (!exitToken) return res.status(400).json({ error: 'exitToken is required' });
+  try {
+    const { FlowSession } = require('../models');
+    const session = await FlowSession.findOne({ where: { exitToken: String(exitToken) } });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (session.status !== 'streaming') {
+      return res.status(409).json({ error: 'Session already ended', totalCents: session.totalCents });
+    }
+    const now = new Date();
+    const elapsedMs      = now.getTime() - new Date(session.tapInAt).getTime();
+    const elapsedMinutes = Math.ceil(elapsedMs / 60000);
+
+    // Per-day cap: subtract what this wallet already paid today
+    const { Op } = require('sequelize');
+    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+    const alreadyToday = (await FlowSession.sum('totalCents', {
+      where: {
+        walletAddress: session.walletAddress,
+        status: 'completed',
+        tapOutAt: { [Op.gte]: startOfDay },
+        id: { [Op.ne]: session.id },
+      },
+    })) ?? 0;
+    const remainingCap = Math.max(0, FLOW_MAX_DAILY_CENTS - alreadyToday);
+    const totalCents   = Math.min(elapsedMinutes * session.ratePerMinuteCents, remainingCap);
+
+    await session.update({ tapOutAt: now, totalCents, status: 'completed' });
+    res.json({
+      ok: true,
+      sessionId: session.id,
+      walletAddress: session.walletAddress,
+      tapInAt: session.tapInAt,
+      tapOutAt: now,
+      elapsedMinutes,
+      totalCents,
+      currency: session.currency,
+    });
+  } catch (err) {
+    console.error('[gym/flow/exit]', err);
+    res.status(500).json({ error: err.message });
+  }
+}

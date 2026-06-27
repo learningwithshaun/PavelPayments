@@ -117,7 +117,7 @@ function Header({ uid }: { uid?: string }) {
       <Link href="/" style={S.back}>← Home</Link>
       <span style={{ color: C.line }}>|</span>
       <span style={{ display: "inline-flex", alignItems: "center", gap: 8, fontWeight: 800, fontSize: 16 }}>
-        <span style={{ fontSize: 18 }}>🎬</span> Streaming
+        <span style={{ fontSize: 18 }}>🎬</span> PavelFlix
       </span>
       {uid && (
         <span style={S.uidPill}>UID&nbsp;<b style={{ color: C.text }}>{uid}</b></span>
